@@ -6,22 +6,20 @@ import base64
 import os
 import tempfile
 
-# 条件付きインポート
-try:
-    import rasterio
-    from skimage.transform import resize
-    RASTERIO_AVAILABLE = True
-    st.sidebar.success("✅ rasterio利用可能")
-except ImportError:
-    RASTERIO_AVAILABLE = False
-    st.sidebar.warning("⚠️ rasterio未利用")
-
-# Streamlit設定
+# Streamlit設定（最初に配置必須）
 st.set_page_config(
     page_title="Prithvi-EO-2.0 洪水検出",
     page_icon="🌊",
     layout="wide"
 )
+
+# 条件付きインポート（st.set_page_config後に配置）
+try:
+    import rasterio
+    from skimage.transform import resize
+    RASTERIO_AVAILABLE = True
+except ImportError:
+    RASTERIO_AVAILABLE = False
 
 def create_download_link(image, filename):
     """画像のダウンロードリンクを作成"""
@@ -324,8 +322,12 @@ def main():
         """)
     
     # サイドバー
+    # サイドバー（main関数内で実行）
     st.sidebar.header("📋 アプリ情報")
+    
+    # rasterio状態表示
     if RASTERIO_AVAILABLE:
+        st.sidebar.success("✅ rasterio利用可能")
         st.sidebar.success("""
         **拡張版の機能:**
         - GeoTIFF完全サポート（rasterio使用）
@@ -336,6 +338,7 @@ def main():
         - 結果ダウンロード
         """)
     else:
+        st.sidebar.warning("⚠️ rasterio未利用")
         st.sidebar.info("""
         **基本版の機能:**
         - 基本的な画像アップロード
