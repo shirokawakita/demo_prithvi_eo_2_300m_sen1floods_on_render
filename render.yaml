@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: prithvi-flood-detection
+    env: python
+    plan: standard  # 2GB RAM必須（1.28GBモデル用）
+    buildCommand: |
+      pip install --upgrade pip
+      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+      pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.headless true --server.port $PORT --server.address 0.0.0.0 --server.maxUploadSize 100 --server.enableCORS false --server.enableXsrfProtection false
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: STREAMLIT_SERVER_HEADLESS
+        value: "true"
+      - key: STREAMLIT_SERVER_ENABLE_CORS
+        value: "false"
+      - key: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
+        value: "false"
+      - key: STREAMLIT_SERVER_MAX_UPLOAD_SIZE
+        value: "100"
+      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+        value: "false"
+      - key: HF_HUB_CACHE
+        value: "/tmp/huggingface_cache"
