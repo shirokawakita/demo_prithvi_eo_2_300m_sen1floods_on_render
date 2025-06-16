@@ -1,370 +1,434 @@
 import streamlit as st
-import torch
 import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
 import io
 import base64
 import os
-import yaml
-import rasterio
-from huggingface_hub import hf_hub_download
-from pathlib import Path
-from skimage.transform import resize
-import cv2
-import gc
+import tempfile
+
+# 条件付きインポート
+try:
+    import rasterio
+    from skimage.transform import resize
+    RASTERIO_AVAILABLE = True
+    st.sidebar.success("✅ rasterio利用可能")
+except ImportError:
+    RASTERIO_AVAILABLE = False
+    st.sidebar.warning("⚠️ rasterio未利用")
 
 # Streamlit設定
 st.set_page_config(
     page_title="Prithvi-EO-2.0 洪水検出",
     page_icon="🌊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
-
-# 環境変数設定（config.tomlの代替）
-def configure_streamlit():
-    """Streamlitの設定を環境変数で行う"""
-    os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
-    os.environ['STREAMLIT_SERVER_PORT'] = str(os.environ.get('PORT', 8501))
-    os.environ['STREAMLIT_SERVER_ADDRESS'] = '0.0.0.0'
-    os.environ['STREAMLIT_SERVER_ENABLE_CORS'] = 'false'
-    os.environ['STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION'] = 'false'
-    os.environ['STREAMLIT_SERVER_MAX_UPLOAD_SIZE'] = '100'
-    os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
-
-configure_streamlit()
-
-class PrithviModelLoader:
-    def __init__(self):
-        self.repo_id = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11"
-        self.model_filename = "Prithvi-EO-V2-300M-TL-Sen1Floods11.pt"
-        self.config_filename = "config.yaml"
-        self.cache_dir = Path("/tmp/prithvi_cache")
-        self.cache_dir.mkdir(exist_ok=True)
-    
-    @st.cache_resource
-    def download_model(_self):
-        """Hugging Face HubからPrithviモデルをダウンロード"""
-        try:
-            with st.spinner("Prithviモデルをダウンロード中... (約1.28GB)"):
-                # プログレスバーを表示
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                status_text.text("モデルファイルをダウンロード中...")
-                progress_bar.progress(25)
-                
-                # モデルファイルをダウンロード
-                model_path = hf_hub_download(
-                    repo_id=_self.repo_id,
-                    filename=_self.model_filename,
-                    cache_dir=str(_self.cache_dir)
-                )
-                
-                progress_bar.progress(75)
-                status_text.text("設定ファイルをダウンロード中...")
-                
-                # 設定ファイルをダウンロード
-                config_path = hf_hub_download(
-                    repo_id=_self.repo_id,
-                    filename=_self.config_filename,
-                    cache_dir=str(_self.cache_dir)
-                )
-                
-                progress_bar.progress(100)
-                status_text.text("ダウンロード完了!")
-                
-                return model_path, config_path
-                
-        except Exception as e:
-            st.error(f"モデルのダウンロードに失敗しました: {e}")
-            return None, None
-    
-    @st.cache_resource
-    def load_model(_self):
-        """モデルを読み込み - エラーハンドリング強化版"""
-        model_path, config_path = _self.download_model()
-        
-        if model_path is None or config_path is None:
-            return None, None
-        
-        try:
-            with st.spinner("モデルを読み込み中..."):
-                # 設定ファイル読み込み
-                with open(config_path, 'r') as f:
-                    config = yaml.safe_load(f)
-                
-                # モデル読み込み - 複数の方法を試行
-                device = torch.device('cpu')
-                
-                st.write("🔄 モデルファイルを解析中...")
-                
-                # 方法1: 標準的なPyTorchモデル読み込み
-                try:
-                    model_data = torch.load(model_path, map_location=device)
-                    st.write(f"✅ モデルデータ型: {type(model_data)}")
-                    
-                    # 辞書形式の場合の処理
-                    if isinstance(model_data, dict):
-                        st.write("📋 モデルは辞書形式です")
-                        st.write(f"利用可能なキー: {list(model_data.keys())}")
-                        
-                        # 一般的なキーパターンを試行
-                        model = None
-                        for key in ['model', 'state_dict', 'model_state_dict', 'network', 'net']:
-                            if key in model_data:
-                                st.write(f"🔑 キー '{key}' を使用してモデルを読み込み中...")
-                                model_state = model_data[key]
-                                
-                                # state_dictの場合
-                                if isinstance(model_state, dict):
-                                    # 簡単なモデルクラスを作成（プレースホルダー）
-                                    model = PrithviPlaceholderModel()
-                                    model.load_state_dict(model_state, strict=False)
-                                else:
-                                    model = model_state
-                                break
-                        
-                        # キーが見つからない場合は最初の値を使用
-                        if model is None and len(model_data) > 0:
-                            first_key = list(model_data.keys())[0]
-                            st.write(f"🔑 デフォルトキー '{first_key}' を使用")
-                            model = model_data[first_key]
-                    
-                    # 直接モデルオブジェクトの場合
-                    else:
-                        model = model_data
-                    
-                    # モデルが正常に読み込まれた場合
-                    if model is not None:
-                        if hasattr(model, 'eval'):
-                            model.eval()
-                            st.success("✅ モデル読み込み成功!")
-                        else:
-                            st.warning("⚠️ モデルにeval()メソッドがありません。プレースホルダーモードで動作します。")
-                    else:
-                        st.error("❌ モデルの読み込みに失敗しました")
-                        return None, None
-                    
-                    # メモリクリーンアップ
-                    gc.collect()
-                    
-                    return model, config
-                    
-                except Exception as load_error:
-                    st.error(f"モデル読み込みエラー: {load_error}")
-                    # プレースホルダーモデルを返す
-                    return PrithviPlaceholderModel(), config
-                    
-        except Exception as e:
-            st.error(f"全体的なエラー: {e}")
-            return None, None
-
-class PrithviPlaceholderModel:
-    """Prithviモデルのプレースホルダー（テスト用）"""
-    def __init__(self):
-        self.device = torch.device('cpu')
-    
-    def eval(self):
-        return self
-    
-    def __call__(self, x):
-        # ダミー予測（実際のモデルが読み込めない場合）
-        batch_size, channels, height, width = x.shape
-        # ランダムな洪水マスクを生成（デモ用）
-        dummy_output = torch.zeros(batch_size, 2, height, width)
-        # 中央部分を洪水として設定
-        center_h, center_w = height // 2, width // 2
-        dummy_output[:, 1, center_h-50:center_h+50, center_w-50:center_w+50] = 1.0
-        return dummy_output
-
-class ImageProcessor:
-    def __init__(self):
-        self.target_size = (512, 512)
-    
-    def process_sentinel2_image(self, uploaded_file):
-        """Sentinel-2画像を処理"""
-        try:
-            # アップロードされたファイルを一時保存
-            temp_path = f"/tmp/{uploaded_file.name}"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            # Rasterioで画像読み込み
-            with rasterio.open(temp_path) as src:
-                # 全バンドを読み込み
-                image_data = src.read()
-                
-                # バンド数確認
-                if image_data.shape[0] < 6:
-                    raise ValueError(f"不十分なバンド数: {image_data.shape[0]} < 6")
-                
-                # 必要な6バンドを選択
-                selected_bands = image_data[:6]
-                
-                # データ型変換 (uint16 -> int16)
-                if selected_bands.dtype == np.uint16:
-                    selected_bands = selected_bands.astype(np.int16)
-                
-                # サイズ調整
-                processed_bands = []
-                for band in selected_bands:
-                    resized_band = resize(band, self.target_size, preserve_range=True)
-                    processed_bands.append(resized_band)
-                
-                processed_image = np.stack(processed_bands, axis=0)
-                
-                # 正規化
-                processed_image = self.normalize_image(processed_image)
-                
-                # 一時ファイル削除
-                os.remove(temp_path)
-                
-                return processed_image
-                
-        except Exception as e:
-            # エラー時も一時ファイルを削除
-            if 'temp_path' in locals() and os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise Exception(f"画像処理エラー: {e}")
-    
-    def normalize_image(self, image):
-        """画像を正規化"""
-        # Prithviモデル用の正規化
-        image = np.clip(image, 1000, 3000)
-        image = (image - 1000) / 2000.0  # 0-1に正規化
-        return image
-    
-    def create_rgb_image(self, image_data):
-        """RGB画像を作成（可視化用）"""
-        # バンド3(Red), 2(Green), 1(Blue)を使用
-        rgb = np.stack([
-            image_data[2],  # Red
-            image_data[1],  # Green  
-            image_data[0]   # Blue
-        ], axis=-1)
-        
-        # 0-255に正規化
-        rgb = ((rgb - rgb.min()) / (rgb.max() - rgb.min()) * 255).astype(np.uint8)
-        
-        return rgb
-    
-    def create_prediction_overlay(self, rgb_image, prediction_mask):
-        """予測マスクをRGB画像にオーバーレイ"""
-        overlay = rgb_image.copy()
-        
-        # 洪水領域を赤色でオーバーレイ
-        flood_mask = prediction_mask == 1
-        overlay[flood_mask] = [255, 0, 0]  # 赤色
-        
-        # 透明度を適用
-        alpha = 0.6
-        result = cv2.addWeighted(rgb_image, 1-alpha, overlay, alpha, 0)
-        
-        return result
 
 def create_download_link(image, filename):
     """画像のダウンロードリンクを作成"""
-    pil_image = Image.fromarray(image)
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format='PNG')
-    buffer.seek(0)
-    
-    b64 = base64.b64encode(buffer.read()).decode()
-    href = f'<a href="data:image/png;base64,{b64}" download="{filename}" style="text-decoration: none; color: #1f77b4;">📥 {filename}</a>'
-    return href
+    try:
+        pil_image = Image.fromarray(image)
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format='PNG')
+        buffer.seek(0)
+        
+        b64 = base64.b64encode(buffer.read()).decode()
+        href = f'<a href="data:image/png;base64,{b64}" download="{filename}">📥 {filename}</a>'
+        return href
+    except Exception as e:
+        return f"ダウンロードエラー: {e}"
 
-def show_system_info():
-    """システム情報を表示"""
-    if st.sidebar.checkbox("システム情報", value=False):
-        try:
-            import psutil
-            memory = psutil.virtual_memory()
-            st.sidebar.write(f"メモリ使用量: {memory.percent:.1f}%")
-            st.sidebar.write(f"利用可能メモリ: {memory.available / 1024**3:.2f}GB")
-        except:
-            st.sidebar.write("システム情報を取得できません")
+def create_demo_prediction(image_shape):
+    """デモ用の洪水予測を作成"""
+    height, width = image_shape
+    prediction = np.zeros((height, width), dtype=np.uint8)
+    
+    # 中央部分と川のような形状を洪水として設定
+    center_h, center_w = height // 2, width // 2
+    
+    # 中央の円形エリア
+    y, x = np.ogrid[:height, :width]
+    mask_circle = (x - center_w)**2 + (y - center_h)**2 <= (min(height, width) // 6)**2
+    prediction[mask_circle] = 1
+    
+    # 川のような線形エリア
+    river_mask = np.abs(y - center_h - (x - center_w) * 0.3) < 20
+    prediction[river_mask] = 1
+    
+    # 小さな池
+    mask_pond = (x - center_w//2)**2 + (y - center_h//2)**2 <= 400
+    prediction[mask_pond] = 1
+    
+    return prediction
+
+def process_geotiff_with_rasterio(uploaded_file):
+    """rasterioを使用してGeoTIFFを処理"""
+    if not RASTERIO_AVAILABLE:
+        return None
+    
+    try:
+        # 一時ファイルに保存
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
+            tmp_file.write(uploaded_file.getbuffer())
+            tmp_path = tmp_file.name
+        
+        with rasterio.open(tmp_path) as src:
+            # 画像情報を表示
+            st.write(f"📊 バンド数: {src.count}")
+            st.write(f"📊 画像サイズ: {src.width} x {src.height}")
+            st.write(f"📊 データ型: {src.dtypes[0]}")
+            st.write(f"📊 座標系: {src.crs}")
+            
+            # 全バンドを読み込み
+            image_data = src.read()  # Shape: (bands, height, width)
+            
+            st.write(f"📊 読み込み完了: {image_data.shape}")
+            
+            # Sentinel-2の場合、最適なバンドを選択
+            if image_data.shape[0] >= 6:
+                # Prithviで使用される6バンド: Blue, Green, Red, NIR_NARROW, SWIR1, SWIR2
+                # 一般的なSentinel-2バンド順序を想定
+                if image_data.shape[0] >= 12:  # 13バンドSentinel-2
+                    # バンド選択: B2(Blue), B3(Green), B4(Red), B8A(NIR), B11(SWIR1), B12(SWIR2)
+                    band_indices = [1, 2, 3, 7, 10, 11]  # 0-indexed
+                    selected_bands = image_data[band_indices]
+                    st.info("🛰️ Sentinel-2 13バンドから6バンドを選択")
+                else:
+                    # 最初の6バンドを使用
+                    selected_bands = image_data[:6]
+                    st.info("🛰️ 最初の6バンドを使用")
+            else:
+                # 利用可能なバンドをすべて使用し、足りない場合は複製
+                selected_bands = image_data
+                while selected_bands.shape[0] < 6:
+                    selected_bands = np.concatenate([selected_bands, image_data[:1]], axis=0)
+                selected_bands = selected_bands[:6]
+                st.warning(f"⚠️ バンド数不足のため調整: {image_data.shape[0]} → 6")
+            
+            # データ型を確認・変換
+            st.write(f"📊 選択バンド形状: {selected_bands.shape}")
+            st.write(f"📊 値域: {selected_bands.min()} - {selected_bands.max()}")
+            
+            # 512x512にリサイズ
+            if selected_bands.shape[1:] != (512, 512):
+                st.info(f"📐 リサイズ中: {selected_bands.shape[1]}x{selected_bands.shape[2]} → 512x512")
+                resized_bands = []
+                for i in range(selected_bands.shape[0]):
+                    resized_band = resize(
+                        selected_bands[i], 
+                        (512, 512), 
+                        preserve_range=True,
+                        anti_aliasing=True
+                    )
+                    resized_bands.append(resized_band)
+                selected_bands = np.stack(resized_bands, axis=0)
+            
+            # RGB画像を作成（バンド3, 2, 1 = Red, Green, Blue）
+            if selected_bands.shape[0] >= 3:
+                rgb_bands = selected_bands[[2, 1, 0]]  # Red, Green, Blue
+                
+                # 正規化（0-255）
+                rgb_normalized = []
+                for band in rgb_bands:
+                    band_min, band_max = band.min(), band.max()
+                    if band_max > band_min:
+                        normalized = ((band - band_min) / (band_max - band_min) * 255).astype(np.uint8)
+                    else:
+                        normalized = np.zeros_like(band, dtype=np.uint8)
+                    rgb_normalized.append(normalized)
+                
+                rgb_image = np.stack(rgb_normalized, axis=-1)  # (H, W, 3)
+            else:
+                # グレースケールからRGBを作成
+                gray = selected_bands[0]
+                gray_norm = ((gray - gray.min()) / (gray.max() - gray.min()) * 255).astype(np.uint8)
+                rgb_image = np.stack([gray_norm, gray_norm, gray_norm], axis=-1)
+        
+        # 一時ファイル削除
+        os.unlink(tmp_path)
+        
+        return rgb_image, selected_bands
+        
+    except Exception as e:
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        st.error(f"rasterio処理エラー: {e}")
+        return None
+def read_geotiff_with_fallback(uploaded_file):
+    """GeoTIFFファイルを複数の方法で読み込み"""
+    
+    # 方法1: rasterioを使用（GeoTIFF専用）
+    if RASTERIO_AVAILABLE:
+        st.info("🛰️ rasterioでGeoTIFF処理を試行中...")
+        result = process_geotiff_with_rasterio(uploaded_file)
+        if result is not None:
+            return result[0], "rasterio"  # RGB画像のみ返す
+    
+    file_bytes = uploaded_file.getbuffer()
+    
+    # 方法2: PILで直接読み込み
+    try:
+        uploaded_file.seek(0)
+        image = Image.open(uploaded_file)
+        st.success("✅ PILで読み込み成功")
+        return image, "PIL"
+    except Exception as e:
+        st.warning(f"⚠️ PIL読み込み失敗: {e}")
+    
+    # 方法3: 一時ファイルとして保存してPILで読み込み
+    try:
+        temp_path = f"/tmp/{uploaded_file.name}"
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+        
+        image = Image.open(temp_path)
+        os.remove(temp_path)  # 一時ファイル削除
+        st.success("✅ 一時ファイル経由で読み込み成功")
+        return image, "temp_file"
+    except Exception as e:
+        st.warning(f"⚠️ 一時ファイル読み込み失敗: {e}")
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
+    
+    # 方法4: バイナリデータから基本的な画像情報を抽出
+    try:
+        # TIFFヘッダーの基本チェック
+        if file_bytes[:4] in [b'II*\x00', b'MM\x00*']:
+            st.info("🔍 GeoTIFFファイルを検出")
+            # 簡易的な512x512グレースケール画像を生成
+            dummy_image = np.random.randint(0, 256, (512, 512), dtype=np.uint8)
+            dummy_rgb = np.stack([dummy_image, dummy_image, dummy_image], axis=-1)
+            pil_image = Image.fromarray(dummy_rgb)
+            st.warning("⚠️ GeoTIFFの直接読み込みはサポートされていません。ダミー画像を生成しました。")
+            return pil_image, "dummy"
+    except Exception as e:
+        st.error(f"❌ バイナリ解析失敗: {e}")
+    
+    return None, None
+
+def process_image_with_fallback(uploaded_file):
+    """画像を複数の方法で処理"""
+    try:
+        # ファイル情報を表示
+        file_info = f"""
+        **ファイル情報:**
+        - 名前: {uploaded_file.name}
+        - サイズ: {uploaded_file.size / 1024 / 1024:.1f} MB
+        - タイプ: {uploaded_file.type}
+        """
+        st.markdown(file_info)
+        
+        # GeoTIFF読み込み試行
+        image, method = read_geotiff_with_fallback(uploaded_file)
+        
+        if image is None:
+            st.error("❌ サポートされていない画像形式です。")
+            st.markdown("""
+            ### 📋 推奨ファイル形式
+            - **GeoTIFF**: Sentinel-2データ推奨（rasterio使用）
+            - **標準画像**: JPG, PNG
+            - **限定的サポート**: 標準TIFF
+            
+            ### 💡 回避策
+            1. Sentinel-2データをGeoTIFF形式で使用
+            2. GISソフトウェアでRGB合成画像を作成
+            3. JPEG/PNG形式に変換
+            """)
+            return None
+        
+        st.write(f"📊 読み込み方法: {method}")
+        
+        # PIL Imageの場合はnumpy配列に変換
+        if isinstance(image, Image.Image):
+            st.write(f"📊 元画像サイズ: {image.size}")
+            st.write(f"📊 元画像モード: {image.mode}")
+            
+            # RGBに変換
+            if image.mode != 'RGB':
+                if image.mode == 'RGBA':
+                    # アルファチャンネルを除去
+                    rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+                    rgb_image.paste(image, mask=image.split()[-1])
+                    image = rgb_image
+                elif image.mode in ['L', 'P']:
+                    # グレースケールやパレットモードをRGBに変換
+                    image = image.convert('RGB')
+                else:
+                    image = image.convert('RGB')
+            
+            # アスペクト比を保持してリサイズ
+            image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            
+            # 512x512の正方形キャンバスに中央配置
+            canvas = Image.new('RGB', (512, 512), (0, 0, 0))  # 黒背景
+            
+            # 中央に配置
+            x = (512 - image.width) // 2
+            y = (512 - image.height) // 2
+            canvas.paste(image, (x, y))
+            
+            # numpy配列に変換
+            image_array = np.array(canvas)
+        else:
+            # すでにnumpy配列の場合（rasterio処理済み）
+            image_array = image
+        
+        st.write(f"📊 処理後サイズ: {image_array.shape}")
+        
+        return image_array
+        
+    except Exception as e:
+        st.error(f"画像処理エラー: {e}")
+        st.markdown("""
+        ### 🔧 エラー対処法
+        1. **ファイル形式確認**: GeoTIFF/JPG/PNG形式を推奨
+        2. **ファイルサイズ**: 100MB以下に縮小
+        3. **ファイル破損**: 別の画像ファイルで試行
+        4. **ブラウザリロード**: ページを更新して再試行
+        """)
+        return None
+
+def create_overlay(rgb_image, prediction_mask):
+    """オーバーレイ画像を作成"""
+    overlay = rgb_image.copy()
+    
+    # 洪水領域を赤色で表示
+    flood_mask = prediction_mask == 1
+    overlay[flood_mask] = [255, 0, 0]  # 赤色
+    
+    # 透明度を適用
+    alpha = 0.6
+    result = (rgb_image * (1 - alpha) + overlay * alpha).astype(np.uint8)
+    
+    return result
 
 def main():
-    st.title("🌊 Prithvi-EO-2.0 洪水検出システム")
-    st.markdown("""
-    **IBM & NASAが開発したPrithvi-EO-2.0モデルを使用したSentinel-2画像からの洪水検出**
+    title = "🌊 Prithvi-EO-2.0 洪水検出システム"
+    if RASTERIO_AVAILABLE:
+        title += "（GeoTIFF対応版）"
+    else:
+        title += "（簡易版）"
     
-    このアプリケーションは[Render](https://render.com)上で動作しています。
-    """)
+    st.title(title)
+    
+    if RASTERIO_AVAILABLE:
+        st.markdown("""
+        **このバージョンはGeoTIFFとSentinel-2データに対応しています**
+        
+        rasterioライブラリを使用して、Sentinel-2 GeoTIFFファイルの完全処理が可能です。
+        """)
+    else:
+        st.markdown("""
+        **このバージョンは基本的な画像処理とデモ予測を行います**
+        
+        現在、rasterioライブラリが利用できないため、基本版で動作しています。
+        """)
     
     # サイドバー
-    st.sidebar.header("🔧 設定")
-    st.sidebar.markdown("### モデル情報")
-    st.sidebar.info("""
-    - **モデル**: Prithvi-EO-2.0-300M
-    - **サイズ**: 1.28GB
-    - **タスク**: 洪水セマンティックセグメンテーション
-    - **入力**: Sentinel-2 (6バンド)
-    - **解像度**: 512×512ピクセル
-    - **精度**: mIoU 88.68%
-    """)
+    st.sidebar.header("📋 アプリ情報")
+    if RASTERIO_AVAILABLE:
+        st.sidebar.success("""
+        **拡張版の機能:**
+        - GeoTIFF完全サポート（rasterio使用）
+        - Sentinel-2多バンド処理
+        - 自動バンド選択・リサイズ
+        - デモ用洪水予測
+        - オーバーレイ表示
+        - 結果ダウンロード
+        """)
+    else:
+        st.sidebar.info("""
+        **基本版の機能:**
+        - 基本的な画像アップロード
+        - 画像サイズ調整（512x512）
+        - デモ用洪水予測
+        - オーバーレイ表示
+        - 結果ダウンロード
+        """)
     
-    # システム情報表示
-    show_system_info()
-    
-    # 警告メッセージ
-    st.sidebar.markdown("### ⚠️ 重要事項")
     st.sidebar.warning("""
-    - 初回起動時は20-30分かかります
-    - 処理時間: 約30-60秒/画像
-    - 最大アップロード: 100MB
+    **制限事項:**
+    - 実際のPrithviモデルは未使用
+    - デモ用の予測結果を表示
     """)
     
-    # モデル初期化
-    if 'model_loaded' not in st.session_state:
-        st.session_state.model_loaded = False
-    
-    if not st.session_state.model_loaded:
-        st.info("🚀 モデルを初期化しています...")
-        model_loader = PrithviModelLoader()
-        model, config = model_loader.load_model()
+    if RASTERIO_AVAILABLE:
+        st.sidebar.markdown("### 🛰️ Sentinel-2対応")
+        st.sidebar.info("""
+        **対応バンド:**
+        - Blue (B2)
+        - Green (B3) 
+        - Red (B4)
+        - NIR Narrow (B8A)
+        - SWIR1 (B11)
+        - SWIR2 (B12)
         
-        if model is not None:
-            st.session_state.model = model
-            st.session_state.config = config
-            st.session_state.model_loaded = True
-            
-            # プレースホルダーモデルの場合は警告表示
-            if isinstance(model, PrithviPlaceholderModel):
-                st.warning("⚠️ プレースホルダーモードで動作しています。デモ用のダミー予測を表示します。")
-            else:
-                st.success("✅ モデルの読み込み完了!")
-                st.balloons()
-        else:
-            st.error("❌ モデルの読み込みに失敗しました")
-            st.stop()
-    
-    # 画像処理器初期化
-    processor = ImageProcessor()
+        **自動処理:**
+        - 13バンド→6バンド選択
+        - 512x512リサイズ
+        - RGB合成生成
+        """)
     
     # ファイルアップロード
-    st.header("📁 Sentinel-2画像のアップロード")
+    st.header("📁 画像アップロード")
     
     uploaded_file = st.file_uploader(
-        "TIFFファイルを選択してください",
-        type=['tif', 'tiff'],
-        help="Sentinel-2 L1Cまたは6バンド対応のGeoTIFFファイル（最大100MB）"
+        "画像ファイルを選択してください",
+        type=['jpg', 'jpeg', 'png', 'tif', 'tiff'],
+        help="JPG、PNG、TIFFファイルに対応（最大100MB）\n⚠️ GeoTIFFは部分的サポート"
     )
     
-    # サンプルデータ情報
-    st.markdown("### 🌍 サンプルデータについて")
-    st.info("""
-    サンプルデータは以下の地域の洪水画像です：
-    - 🇮🇳 **インド**: モンスーンによる洪水
-    - 🇪🇸 **スペイン**: 河川氾濫
-    - 🇺🇸 **アメリカ**: ハリケーンによる洪水
+    # デモ機能の説明
+    st.markdown("### 🎯 機能概要")
+    if RASTERIO_AVAILABLE:
+        st.success("""
+        **GeoTIFF対応版の機能:**
+        - **Sentinel-2 GeoTIFF**: 完全サポート（13→6バンド自動選択）
+        - **自動前処理**: サイズ調整、バンド選択、RGB合成
+        - **デモ洪水検出**: パターンベース予測
+        - **結果可視化**: 入力画像、予測マスク、オーバーレイ
+        - **ダウンロード**: PNG形式での結果保存
+        """)
+    else:
+        st.info("""
+        **基本版の機能:**
+        - **基本画像処理**: JPG/PNG/TIFF対応
+        - **サイズ調整**: 512x512への自動リサイズ
+        - **デモ洪水検出**: パターンベース予測
+        - **結果可視化**: 入力画像、予測マスク、オーバーレイ
+        - **ダウンロード**: PNG形式での結果保存
+        """)
     
-    実際のサンプルファイルは元のリポジトリからダウンロードしてご利用ください。
-    """)
+    # GeoTIFFに関する情報
+    if RASTERIO_AVAILABLE:
+        st.markdown("### 🛰️ Sentinel-2 GeoTIFF処理")
+        st.info("""
+        **対応形式:**
+        - **Sentinel-2 L1C**: 13バンドGeoTIFF
+        - **カスタムGeoTIFF**: 6バンド以上のマルチバンド画像
+        - **自動処理**: バンド選択、リサイズ、正規化
+        
+        **バンドマッピング（Sentinel-2）:**
+        - Blue (B2) → バンド1
+        - Green (B3) → バンド2  
+        - Red (B4) → バンド3
+        - NIR Narrow (B8A) → バンド4
+        - SWIR1 (B11) → バンド5
+        - SWIR2 (B12) → バンド6
+        """)
+    else:
+        st.markdown("### ⚠️ GeoTIFFファイルについて")
+        st.warning("""
+        **現在の制限:**
+        - **rasterio未利用**: GeoTIFF完全サポートなし
+        - **代替処理**: PIL + フォールバック機能
+        - **推奨形式**: JPG/PNG形式への変換
+        
+        **Sentinel-2データを使用する場合:**
+        1. GISソフトウェアでRGB合成
+        2. JPEG/PNG形式で保存
+        3. または rasterio対応版を使用
+        """)
     
-    # 画像処理と予測
     if uploaded_file is not None:
         try:
             # ファイル情報表示
@@ -372,136 +436,148 @@ def main():
             
             # 画像処理
             with st.spinner("画像を処理中..."):
-                processed_image = processor.process_sentinel2_image(uploaded_file)
-                
-                # RGB可視化画像作成
-                rgb_image = processor.create_rgb_image(processed_image)
+                processed_image = process_image_with_fallback(uploaded_file)
             
-            st.success("✅ 画像処理完了!")
-            
-            # 入力画像プレビュー
-            st.subheader("🖼️ 入力画像プレビュー")
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.image(rgb_image, caption="RGB合成画像 (バンド3,2,1)", use_column_width=True)
-            
-            with col2:
-                st.markdown("**画像情報**")
-                st.write(f"- サイズ: {processed_image.shape[1]}×{processed_image.shape[2]}")
-                st.write(f"- バンド数: {processed_image.shape[0]}")
-                st.write(f"- データ型: {processed_image.dtype}")
-            
-            # 予測実行
-            st.header("🧠 AI洪水検出")
-            
-            if st.button("🔍 洪水検出を実行", type="primary", use_container_width=True):
-                with st.spinner("Prithviモデルで予測中..."):
-                    # 進行状況表示
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    status_text.text("テンソルに変換中...")
-                    progress_bar.progress(25)
-                    
-                    # テンソルに変換
-                    input_tensor = torch.from_numpy(processed_image).unsqueeze(0).float()
-                    
-                    status_text.text("AI予測実行中...")
-                    progress_bar.progress(50)
-                    
-                    # 予測実行
-                    with torch.no_grad():
-                        prediction = st.session_state.model(input_tensor)
-                        prediction_mask = torch.argmax(prediction, dim=1).squeeze().numpy()
-                    
-                    status_text.text("結果画像を生成中...")
-                    progress_bar.progress(75)
-                    
-                    # オーバーレイ画像作成
-                    overlay_image = processor.create_prediction_overlay(rgb_image, prediction_mask)
-                    
-                    progress_bar.progress(100)
-                    status_text.text("完了!")
-                    
-                    # メモリクリーンアップ
-                    del prediction, input_tensor
-                    gc.collect()
+            if processed_image is not None:
+                st.success("✅ 画像処理完了!")
                 
-                # プレースホルダーモデル使用時の警告
-                if isinstance(st.session_state.model, PrithviPlaceholderModel):
-                    st.warning("⚠️ デモ用のダミー予測結果を表示しています。実際のPrithviモデルが正常に読み込まれていません。")
-                
-                # 結果表示
-                st.header("📊 検出結果")
-                
-                # 統計情報
-                total_pixels = prediction_mask.size
-                flood_pixels = np.sum(prediction_mask == 1)
-                flood_ratio = flood_pixels / total_pixels * 100
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("総ピクセル数", f"{total_pixels:,}")
-                col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
-                col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
-                
-                # 結果画像表示
-                col1, col2, col3 = st.columns(3)
+                # 入力画像プレビュー
+                st.subheader("🖼️ 入力画像")
+                col1, col2 = st.columns([2, 1])
                 
                 with col1:
-                    st.subheader("入力画像 (RGB)")
-                    st.image(rgb_image, use_column_width=True)
+                    st.image(processed_image, caption="処理済み画像 (512x512)", use_container_width=True)
                 
                 with col2:
-                    st.subheader("洪水予測マスク")
-                    # 予測マスクを可視化用に変換
-                    mask_vis = (prediction_mask * 255).astype(np.uint8)
-                    st.image(mask_vis, use_column_width=True)
+                    st.markdown("**画像情報**")
+                    st.write(f"- サイズ: {processed_image.shape[1]}×{processed_image.shape[0]}")
+                    st.write(f"- チャンネル数: {processed_image.shape[2]}")
+                    st.write(f"- データ型: {processed_image.dtype}")
+                    st.write(f"- 値域: {processed_image.min()} - {processed_image.max()}")
+                    
+                    # Streamlit表示用の詳細情報
+                    st.markdown("**表示設定**")
+                    st.write("- 表示方法: use_container_width=True")
+                    st.write("- アスペクト比: 維持")
                 
-                with col3:
-                    st.subheader("オーバーレイ結果")
-                    st.image(overlay_image, use_column_width=True)
+                # 予測実行
+                st.header("🧠 デモ洪水検出")
                 
-                # ダウンロードセクション
-                st.subheader("💾 結果ダウンロード")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown(create_download_link(rgb_image, "input_rgb.png"), unsafe_allow_html=True)
-                
-                with col2:
-                    st.markdown(create_download_link(np.stack([mask_vis]*3, axis=-1), "prediction_mask.png"), unsafe_allow_html=True)
-                
-                with col3:
-                    st.markdown(create_download_link(overlay_image, "flood_overlay.png"), unsafe_allow_html=True)
-                
-                # 解釈ガイド
-                st.subheader("📖 結果の解釈")
-                st.markdown("""
-                - **白い領域**: 洪水と予測された水域
-                - **黒い領域**: 非洪水域（陸地）
-                - **赤い領域**: オーバーレイ画像の洪水領域
-                
-                **注意**: 雲や影の影響で誤検出が生じる場合があります。
-                """)
-                
+                if st.button("🔍 洪水検出を実行（デモ）", type="primary", use_container_width=True):
+                    with st.spinner("デモ予測を実行中..."):
+                        # デモ予測生成
+                        prediction_mask = create_demo_prediction(processed_image.shape[:2])
+                        
+                        # オーバーレイ画像作成
+                        overlay_image = create_overlay(processed_image, prediction_mask)
+                    
+                    st.success("✅ デモ予測完了!")
+                    
+                    # 結果表示
+                    st.header("📊 検出結果（デモ）")
+                    
+                    # 統計情報
+                    total_pixels = prediction_mask.size
+                    flood_pixels = np.sum(prediction_mask == 1)
+                    flood_ratio = flood_pixels / total_pixels * 100
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("総ピクセル数", f"{total_pixels:,}")
+                    col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
+                    col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
+                    
+                    # 結果画像表示
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.subheader("入力画像")
+                        st.image(processed_image, use_container_width=True)
+                    
+                    with col2:
+                        st.subheader("洪水予測マスク（デモ）")
+                        mask_vis = (prediction_mask * 255).astype(np.uint8)
+                        # グレースケールをカラーに変換
+                        mask_color = np.stack([mask_vis, mask_vis, mask_vis], axis=-1)
+                        st.image(mask_color, use_container_width=True)
+                    
+                    with col3:
+                        st.subheader("オーバーレイ結果")
+                        st.image(overlay_image, use_container_width=True)
+                    
+                    # ダウンロードセクション
+                    st.subheader("💾 結果ダウンロード")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown(create_download_link(processed_image, "input_image.png"), unsafe_allow_html=True)
+                    
+                    with col2:
+                        st.markdown(create_download_link(mask_color, "prediction_mask.png"), unsafe_allow_html=True)
+                    
+                    with col3:
+                        st.markdown(create_download_link(overlay_image, "flood_overlay.png"), unsafe_allow_html=True)
+                    
+                    # 解釈ガイド
+                    st.subheader("📖 結果の解釈（デモ版）")
+                    st.markdown("""
+                    - **白い領域**: デモ洪水予測エリア
+                    - **黒い領域**: 非洪水域
+                    - **赤い領域**: オーバーレイの洪水表示
+                    
+                    **重要**: これはデモンストレーション用の予測結果です。
+                    実際のPrithvi-EO-2.0モデルによる洪水検出ではありません。
+                    """)
+                    
+                    # 技術情報
+                    st.subheader("🔧 技術情報")
+                    st.markdown("""
+                    **現在の制限:**
+                    - Sentinel-2特有の処理は未実装
+                    - 実際のPrithviモデル未使用
+                    - 基本的な画像処理のみ
+                    
+                    **将来の改善:**
+                    - 実際のPrithviモデル統合
+                    - Sentinel-2バンド処理
+                    - より高精度な洪水検出
+                    """)
+            
         except Exception as e:
             st.error(f"❌ エラー: {e}")
             st.markdown("### 🔧 トラブルシューティング")
             st.markdown("""
-            - ファイルが正しいTIFF形式か確認してください
+            - サポートされている画像形式か確認してください
             - ファイルサイズが100MB以下か確認してください
-            - Sentinel-2データで6バンド以上含まれているか確認してください
+            - 画像ファイルが破損していないか確認してください
             """)
+    
+    else:
+        # 使い方ガイド
+        st.markdown("### 📋 使い方")
+        st.markdown("""
+        1. **画像をアップロード**: JPG、PNG、TIFFファイルを選択
+        2. **処理確認**: 画像が512x512にリサイズされます
+        3. **デモ予測実行**: ボタンクリックで洪水検出デモを実行
+        4. **結果確認**: 3つの画像（入力、マスク、オーバーレイ）を確認
+        5. **ダウンロード**: 必要に応じて結果をダウンロード
+        """)
+        
+        st.markdown("### 🎯 デモの目的")
+        st.info("""
+        この簡易版は以下を目的としています：
+        - Renderでの基本的な動作確認
+        - 画像処理パイプラインのテスト
+        - ユーザーインターフェースの検証
+        - 将来的なPrithviモデル統合の準備
+        """)
     
     # フッター
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666;'>
-        <p>🌊 Prithvi-EO-2.0 洪水検出システム | Powered by IBM & NASA | Running on Render</p>
-        <p>モデル: <a href='https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11'>Hugging Face</a> | 
-        ソースコード: <a href='https://github.com/shirokawakita/demo_prithvi_eo_2_300m_sen1floods'>GitHub</a></p>
+        <p>🌊 Prithvi-EO-2.0 洪水検出システム（簡易版）| Running on Render</p>
+        <p>元のプロジェクト: <a href='https://github.com/shirokawakita/demo_prithvi_eo_2_300m_sen1floods'>GitHub</a></p>
     </div>
     """, unsafe_allow_html=True)
 
