@@ -586,4 +586,305 @@ def main():
     elif model_status['pytorch']:
         st.info("""
         **🤖 AI部分統合版の特徴:**
-        - 🧠 **PyTorch統合
+        - 🧠 **PyTorch統合**: 機械学習フレームワーク利用可能
+        - 🔬 **スマート予測**: NDWI等の水域指標を使用
+        - 📐 **自動処理**: リサイズ、正規化、前処理
+        - 🎨 **高品質表示**: 最適化されたバンド組み合わせ
+        """)
+    else:
+        st.info("""
+        **📸 基本版の特徴:**
+        - 📐 **自動リサイズ**: 512x512への最適化
+        - 🎨 **アスペクト比保持**: 画像の歪み防止
+        - 🔄 **フォールバック**: 複数読み込み方法を試行
+        - 💡 **デモ予測**: パターンベース洪水検出
+        """)
+    
+    if uploaded_file is not None:
+        try:
+            # ファイル受信確認
+            st.success(f"✅ ファイル受信: {uploaded_file.name} ({uploaded_file.size / 1024 / 1024:.1f} MB)")
+            
+            # 画像処理
+            with st.spinner("画像を処理中..."):
+                rgb_image, multiband_data = process_image_with_fallback(uploaded_file)
+            
+            if rgb_image is not None:
+                st.success("✅ 画像処理完了!")
+                
+                # 入力画像プレビュー
+                st.subheader("🖼️ 入力画像")
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.image(rgb_image, caption="処理済み画像 (512x512)", use_container_width=True)
+                
+                with col2:
+                    st.markdown("**画像情報**")
+                    st.write(f"- サイズ: {rgb_image.shape[1]}×{rgb_image.shape[0]}")
+                    st.write(f"- チャンネル数: {rgb_image.shape[2]}")
+                    st.write(f"- データ型: {rgb_image.dtype}")
+                    st.write(f"- 値域: {rgb_image.min()} - {rgb_image.max()}")
+                    
+                    if multiband_data is not None:
+                        st.markdown("**マルチバンド情報**")
+                        st.write(f"- バンド数: {multiband_data.shape[0] if len(multiband_data.shape) == 3 else 'N/A'}")
+                        st.write(f"- データ形状: {multiband_data.shape}")
+                
+                # 予測実行
+                st.header("🧠 洪水検出")
+                
+                # 使用するモデルの表示
+                if model_status['pytorch'] and 'model' in st.session_state and st.session_state.model is not None:
+                    model_type = "Prithvi-EO-2.0 AIモデル"
+                    model_description = "実際のIBM&NASAモデルまたは高度なAI予測を使用"
+                    button_text = "🤖 AI洪水検出を実行"
+                elif model_status['pytorch']:
+                    model_type = "スマート予測モデル"
+                    model_description = "NDWI等の水域指標を使用した高度な予測"
+                    button_text = "🔬 スマート洪水検出を実行"
+                else:
+                    model_type = "デモ予測モデル"
+                    model_description = "パターンベースのデモ予測"
+                    button_text = "💡 デモ洪水検出を実行"
+                
+                st.info(f"**使用モデル**: {model_type}\n\n{model_description}")
+                
+                if st.button(button_text, type="primary", use_container_width=True):
+                    with st.spinner("洪水検出を実行中..."):
+                        try:
+                            if model_status['pytorch'] and 'model' in st.session_state and st.session_state.model is not None:
+                                # Prithviモデルで予測
+                                st.info("🧠 Prithviモデルで予測実行中...")
+                                
+                                # 前処理
+                                if multiband_data is not None and len(multiband_data.shape) == 3:
+                                    processed_data = preprocess_for_prithvi(multiband_data.transpose(1, 2, 0))
+                                else:
+                                    processed_data = preprocess_for_prithvi(rgb_image)
+                                
+                                if processed_data is not None:
+                                    # テンソルに変換
+                                    input_tensor = torch.from_numpy(processed_data).unsqueeze(0).float()
+                                    st.write(f"📊 入力テンソル形状: {input_tensor.shape}")
+                                    
+                                    # 予測実行
+                                    with torch.no_grad():
+                                        prediction = st.session_state.model(input_tensor)
+                                        prediction_mask = torch.argmax(prediction, dim=1).squeeze().numpy()
+                                    
+                                    st.success("✅ Prithvi AI予測完了!")
+                                else:
+                                    raise Exception("前処理に失敗しました")
+                                
+                            elif model_status['pytorch']:
+                                # PyTorchを使用したスマート予測
+                                st.info("🔬 スマート予測実行中...")
+                                
+                                if multiband_data is not None and len(multiband_data.shape) == 3:
+                                    # マルチバンドデータでNDWI計算
+                                    bands = multiband_data
+                                    if bands.shape[0] >= 3:
+                                        green = bands[1].astype(np.float32)
+                                        red = bands[2].astype(np.float32) if bands.shape[0] > 2 else green
+                                        nir = bands[3].astype(np.float32) if bands.shape[0] > 3 else red
+                                        
+                                        # NDWI計算
+                                        ndwi = (green - nir) / (green + nir + 1e-8)
+                                        
+                                        # 水域検出
+                                        water_threshold = np.percentile(ndwi, 80)
+                                        prediction_mask = (ndwi > water_threshold).astype(np.uint8)
+                                    else:
+                                        prediction_mask = create_demo_prediction(rgb_image.shape[:2])
+                                else:
+                                    # RGB画像から水域を推定
+                                    hsv = Image.fromarray(rgb_image).convert('HSV')
+                                    hsv_array = np.array(hsv)
+                                    
+                                    # 青い領域（水域の可能性）を検出
+                                    hue = hsv_array[:, :, 0]
+                                    saturation = hsv_array[:, :, 1]
+                                    value = hsv_array[:, :, 2]
+                                    
+                                    # 水域条件（青色系で明度が中程度）
+                                    water_condition = (
+                                        ((hue > 90) & (hue < 150)) |  # 青-シアン系
+                                        (value < 100)  # 暗い領域
+                                    ) & (saturation > 30)
+                                    
+                                    prediction_mask = water_condition.astype(np.uint8)
+                                
+                                st.success("✅ スマート予測完了!")
+                            else:
+                                # デモ予測
+                                st.info("💡 デモ予測実行中...")
+                                prediction_mask = create_demo_prediction(rgb_image.shape[:2])
+                                st.success("✅ デモ予測完了!")
+                            
+                            # オーバーレイ画像作成
+                            overlay_image = create_overlay(rgb_image, prediction_mask)
+                        
+                        except Exception as predict_error:
+                            st.error(f"❌ 予測エラー: {predict_error}")
+                            st.info("💡 デモ予測にフォールバック中...")
+                            prediction_mask = create_demo_prediction(rgb_image.shape[:2])
+                            overlay_image = create_overlay(rgb_image, prediction_mask)
+                    
+                    # 結果表示
+                    if model_status['pytorch'] and 'model' in st.session_state and st.session_state.model is not None:
+                        result_title = "📊 Prithvi AI検出結果"
+                    elif model_status['pytorch']:
+                        result_title = "📊 スマート検出結果"
+                    else:
+                        result_title = "📊 デモ検出結果"
+                    
+                    st.header(result_title)
+                    
+                    # 統計情報
+                    total_pixels = prediction_mask.size
+                    flood_pixels = np.sum(prediction_mask == 1)
+                    flood_ratio = flood_pixels / total_pixels * 100
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("総ピクセル数", f"{total_pixels:,}")
+                    col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
+                    col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
+                    
+                    # 結果画像表示
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.subheader("入力画像")
+                        st.image(rgb_image, use_container_width=True)
+                    
+                    with col2:
+                        if model_status['pytorch'] and 'model' in st.session_state and st.session_state.model is not None:
+                            st.subheader("Prithvi AI予測")
+                        elif model_status['pytorch']:
+                            st.subheader("スマート予測")
+                        else:
+                            st.subheader("デモ予測")
+                        mask_vis = (prediction_mask * 255).astype(np.uint8)
+                        mask_color = np.stack([mask_vis, mask_vis, mask_vis], axis=-1)
+                        st.image(mask_color, use_container_width=True)
+                    
+                    with col3:
+                        st.subheader("オーバーレイ結果")
+                        st.image(overlay_image, use_container_width=True)
+                    
+                    # ダウンロードセクション
+                    st.subheader("💾 結果ダウンロード")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown(create_download_link(rgb_image, "input_image.png"), unsafe_allow_html=True)
+                    
+                    with col2:
+                        if model_status['pytorch']:
+                            filename = "ai_prediction.png"
+                        else:
+                            filename = "demo_prediction.png"
+                        st.markdown(create_download_link(mask_color, filename), unsafe_allow_html=True)
+                    
+                    with col3:
+                        st.markdown(create_download_link(overlay_image, "flood_overlay.png"), unsafe_allow_html=True)
+                    
+                    # 解釈ガイド
+                    st.subheader("📖 結果の解釈")
+                    if model_status['pytorch'] and 'model' in st.session_state and st.session_state.model is not None:
+                        st.markdown("""
+                        - **白い領域**: Prithvi-EO-2.0モデルが洪水と予測した水域
+                        - **黒い領域**: 非洪水域（陸地）
+                        - **赤い領域**: オーバーレイの洪水表示
+                        
+                        **精度情報**: このモデルはmIoU 88.68%の高精度を持ちます。
+                        """)
+                    elif model_status['pytorch']:
+                        st.markdown("""
+                        - **白い領域**: 水域指標（NDWI等）による洪水予測エリア
+                        - **黒い領域**: 非洪水域
+                        - **赤い領域**: オーバーレイの洪水表示
+                        
+                        **手法**: NDWI（正規化水域指標）やHSV色空間解析を使用。
+                        """)
+                    else:
+                        st.markdown("""
+                        - **白い領域**: デモ洪水予測エリア
+                        - **黒い領域**: 非洪水域
+                        - **赤い領域**: オーバーレイの洪水表示
+                        
+                        **注意**: これはデモンストレーション用の予測結果です。
+                        """)
+            
+        except Exception as e:
+            st.error(f"❌ エラー: {e}")
+            st.markdown("### 🔧 トラブルシューティング")
+            st.markdown("""
+            - サポートされている画像形式か確認してください
+            - ファイルサイズが100MB以下か確認してください
+            - 画像ファイルが破損していないか確認してください
+            """)
+    
+    else:
+        # 使い方ガイド
+        st.markdown("### 📋 使い方")
+        st.markdown("""
+        1. **画像をアップロード**: 対応形式のファイルを選択
+        2. **自動処理**: 画像が512x512にリサイズされます
+        3. **AI予測実行**: ボタンクリックで洪水検出を実行
+        4. **結果確認**: 3つの画像（入力、予測、オーバーレイ）を確認
+        5. **ダウンロード**: 必要に応じて結果をダウンロード
+        """)
+        
+        # 技術情報
+        st.markdown("### 🔬 技術情報")
+        if model_status['prithvi_ready']:
+            st.info("""
+            **Prithvi-EO-2.0統合版**
+            - IBM & NASAが開発した最新の地球観測基盤モデル
+            - Sen1Floods11データセットでファインチューニング済み
+            - Vision Transformer + UperNet Decoderアーキテクチャ
+            - テストデータでmIoU 88.68%の高精度を達成
+            """)
+        elif model_status['pytorch']:
+            st.info("""
+            **スマート予測版**
+            - NDWI（正規化水域指標）による水域検出
+            - HSV色空間解析による補完的水域推定
+            - マルチバンドデータからの特徴抽出
+            - PyTorchフレームワークによる高速処理
+            """)
+        else:
+            st.info("""
+            **基本デモ版**
+            - パターンベースの洪水エリア生成
+            - 画像処理パイプラインのテスト
+            - ユーザーインターフェースの検証
+            - 将来的なAI統合の準備
+            """)
+        
+        # 次のステップ案内
+        if model_status['pytorch'] and 'model' not in st.session_state:
+            st.markdown("### 🚀 次のステップ")
+            st.info("""
+            **Prithviモデルを使用するには:**
+            1. 画像をアップロードしてください
+            2. システムがPrithviモデルの読み込みオプションを表示します
+            3. 「Prithviモデルを読み込む」ボタンをクリック
+            4. 初回は約1.28GBのモデルダウンロードが必要です
+            """)
+    
+    # フッター
+    st.markdown("---")
+    st.markdown(f"""
+    <div style='text-align: center; color: #666;'>
+        <p>🌊 Prithvi-EO-2.0 洪水検出システム | Running on Render</p>
+        <p>バージョン: {'AI統合版' if model_status['prithvi_ready'] else 'スマート版' if model_status['pytorch'] else '基本版'}</p>
+        <p>元のプロジェクト: <a href='https://github.com/shirokawakita/demo_prithvi_eo_2_300m_sen1floods'>GitHub</a></p>
+    </div>
+    """, unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
