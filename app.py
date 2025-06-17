@@ -27,38 +27,26 @@ import asyncio
 import threading
 import tempfile
 
-# 現在のデプロイ情報を表示
-st.sidebar.markdown("""
-### 🚀 現在のデプロイ情報
-- **プラン**: Standard Plan (2GB RAM) ✅
-- **モード**: 完全版 Prithvi-EO-2.0
-- **GitHub**: [リポジトリ](https://github.com/shirokawakita/demo_prithvi_eo_2_300m_sen1floods_on_render)
-
-### 🧠 実装中の機能
-- 実際のPrithvi-EO-2.0モデル
-- 高精度洪水検出
-- Sentinel-2画像処理
-- 科学的に妥当な結果
-
-### 💡 技術情報
-- **RAM**: 2GB（1.28GBモデル対応）
-- **処理**: CPU最適化
-- **キャッシュ**: HuggingFace Hub
-""")
-
-# Import functions from inference.py (Standard Plan対応)
+# Import functions from inference.py (main.pyと同じ)
 INFERENCE_AVAILABLE = False
 TERRATORCH_ERROR = None
 
-# terratorch無しでの独自実装
 try:
-    # inference.pyを使わずに独自実装で動作
-    st.info("💡 **Standard Plan**: terratorch無しで独自Prithviモデル実装を使用")
-    INFERENCE_AVAILABLE = "standalone"
+    # main.pyと同じimport
+    from inference import (
+        SemanticSegmentationTask,
+        Sen1Floods11NonGeoDataModule,
+        load_example,
+        run_model,
+        save_prediction
+    )
+    INFERENCE_AVAILABLE = True
+    st.success("✅ terratorch + inference.py が正常に読み込まれました")
     
-except Exception as e:
+except ImportError as e:
     TERRATORCH_ERROR = str(e)
-    st.error(f"❌ 予期しないエラー: {e}")
+    st.error(f"❌ terratorch/inference.pyのインポートエラー: {e}")
+    st.warning("⚠️ 独自実装のフォールバックモデルを使用します")
     INFERENCE_AVAILABLE = False
 
 # イベントループ問題を修正
@@ -529,37 +517,55 @@ def show_system_info():
             st.sidebar.write("システム情報を取得できません")
 
 def initialize_model():
-    """Standard Planでモデルを初期化"""
+    """main.pyと同じ方式でPrithviモデルを初期化"""
     try:
-        if INFERENCE_AVAILABLE == "standalone":
-            st.info("🚀 Standard Plan: 独自Prithviモデルを初期化しています...")
+        if INFERENCE_AVAILABLE == True:
+            # main.pyと同じterratorch使用
+            st.info("🔄 main.pyと同じ方式でPrithvi-EO-2.0モデルを初期化中...")
             try:
-                model_loader = StandalonePrithviLoader()
-                model, datamodule, config = model_loader.download_and_load_model()
+                # main.pyと同じSemanticSegmentationTask
+                model = SemanticSegmentationTask(
+                    model="prithvi_eo_2_300m_sen1floods",
+                    backbone="prithvi_eo_2_300m",
+                    backbone_pretrained="prithvi_eo_2_300m.pt",
+                    in_channels=6,
+                    num_classes=2,
+                    ignore_index=-1,
+                    num_frames=1,
+                    pretrained=True,
+                    freeze_backbone=False,
+                    freeze_decoder=False,
+                )
                 
-                if model is not None:
-                    st.session_state.model = model
-                    st.session_state.data_module = datamodule
-                    st.session_state.config = config
-                    st.success("✅ **Standard Plan**: 独自Prithviモデル初期化完了!")
-                    return True
-                else:
-                    raise Exception("モデル初期化に失敗")
-                    
-            except Exception as e:
-                st.error(f"❌ 独自Prithviモデル初期化エラー: {e}")
-                # フォールバックモデルを作成
-                fallback_model = AdvancedPrithviModel()
-                fallback_model.eval()
-                st.session_state.model = fallback_model
-                st.session_state.data_module = None
+                # main.pyと同じデータモジュール
+                datamodule = Sen1Floods11NonGeoDataModule(
+                    batch_size=1,
+                    num_workers=0,
+                    val_split=0.2,
+                    test_split=0.1,
+                    means=[
+                        1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392,
+                        1263.73947144, 1645.40315126
+                    ],
+                    stds=[
+                        633.15169573, 650.2842772, 712.12507725, 965.23119807,
+                        948.9819932, 1108.06650639
+                    ]
+                )
+                
+                st.session_state.model = model
+                st.session_state.data_module = datamodule
                 st.session_state.config = {}
-                st.warning("⚠️ フォールバックモデルを使用します")
+                st.success("✅ **terratorch使用**: 実際のPrithvi-EO-2.0モデル初期化完了!")
                 return True
                 
+            except Exception as e:
+                st.error(f"❌ terratorch Prithviモデル初期化エラー: {e}")
+                raise e
+                
         else:
-            # 最終フォールバック
-            st.warning("⚠️ Standaloneモード以外での動作")
+            # terratorch未使用の場合はフォールバック
+            st.warning("⚠️ terratorch未使用: フォールバックモデルを使用")
             fallback_model = SimpleCNNModel(in_channels=6, num_classes=2)
             fallback_model.eval()
             st.session_state.model = fallback_model
@@ -894,11 +900,15 @@ def main():
     with st.sidebar:
         st.subheader("🤖 モデル情報")
         if hasattr(st.session_state, 'model') and st.session_state.model is not None:
-            if isinstance(st.session_state.model, AdvancedPrithviModel):
-                st.success("✅ **独自Prithviモデル**を使用中です。")
+            if INFERENCE_AVAILABLE == True:
+                st.success("✅ **実際のPrithvi-EO-2.0モデル**を使用中です。")
+                st.info("🛰️ terratorch + SemanticSegmentationTask")
+                st.info("📊 main.pyと同じ方式")
+            elif isinstance(st.session_state.model, AdvancedPrithviModel):
+                st.warning("⚠️ **独自Prithviモデル**を使用中です。")
                 st.info("🚀 Standard Plan: 2GB RAM環境でPrithvi風アーキテクチャを動作")
             elif isinstance(st.session_state.model, SimpleCNNModel):
-                st.warning("⚠️ **簡易モデル**を使用中です。")
+                st.error("⚠️ **簡易モデル**を使用中です。")
                 st.error("⚠️ **注意**: 現在プレースホルダーモデルを使用中です。実際のPrithviモデルではありません。")
                 st.info("💡 実際のPrithviモデルが正しく読み込まれていない可能性があります。")
             else:
@@ -995,11 +1005,14 @@ def main():
             st.header("🧠 AI洪水検出")
             
             # モデルタイプの確認表示
-            if isinstance(st.session_state.model, SimpleCNNModel):
+            if INFERENCE_AVAILABLE == True:
+                st.success("✅ **実際のPrithvi-EO-2.0モデル**を使用中です（main.pyと同じ）。")
+                st.info("🛰️ terratorch + SemanticSegmentationTask使用")
+            elif isinstance(st.session_state.model, SimpleCNNModel):
                 st.error("⚠️ **注意**: 現在プレースホルダーモデルを使用中です。実際のPrithviモデルではありません。")
                 st.info("💡 実際のPrithviモデルが正しく読み込まれていない可能性があります。")
             elif isinstance(st.session_state.model, AdvancedPrithviModel):
-                st.success("✅ **Prithviモデル**を使用中です。")
+                st.warning("⚠️ **独自Prithviモデル**を使用中です。")
             else:
                 st.warning("⚠️ **未知のモデル**が読み込まれています。")
             
@@ -1013,10 +1026,26 @@ def main():
                         st.info("📷 元画像を使用して推論を実行")
                     
                     with st.spinner("🔮 洪水検出を実行中..."):
-                        # 現実的な洪水検出を実行
-                        flood_mask, flood_prob = create_realistic_flood_prediction(
-                            display_rgb_image, processed_tensor, st.session_state.model
-                        )
+                        # terratorch使用時はmain.pyと同じ方式
+                        if INFERENCE_AVAILABLE == True:
+                            st.info("🔄 main.pyと同じ方式で推論実行中...")
+                            # main.pyと同じrun_model関数を使用
+                            prediction = run_model(
+                                processed_tensor, 
+                                st.session_state.model, 
+                                st.session_state.data_module
+                            )
+                            
+                            # 予測結果からマスクを作成
+                            flood_prob = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
+                            flood_mask = flood_prob > 0.5  # 50%以上で洪水判定
+                            
+                            st.success("✅ main.py方式での推論完了")
+                        else:
+                            # フォールバック時は独自実装
+                            flood_mask, flood_prob = create_realistic_flood_prediction(
+                                display_rgb_image, processed_tensor, st.session_state.model
+                            )
                         
                         # 予測マスク画像を作成（白黒）
                         prediction_image = np.zeros_like(display_rgb_image)
