@@ -597,63 +597,70 @@ def initialize_model():
                     status_text.text("🔧 モデルファクトリーを準備中...")
                     progress_bar.progress(10)
                     
-                    # プラットフォーム対応のモデル初期化
+                    # Streamlit環境対応のモデル初期化
                     try:
-                        # Linux/Unix系でのタイムアウト付き初期化
-                        if os.name == 'posix':
-                            import signal
-                            
-                            def timeout_handler(signum, frame):
-                                raise TimeoutError("モデル初期化がタイムアウトしました")
-                            
-                            # 60秒でタイムアウト
-                            signal.signal(signal.SIGALRM, timeout_handler)
-                            signal.alarm(60)
-                            
-                            try:
-                                status_text.text("🔧 SemanticSegmentationTaskを作成中...")
-                                progress_bar.progress(30)
-                                
-                                model = SemanticSegmentationTask(
-                                    model_args=model_args,
-                                    model_factory="EncoderDecoderFactory",
-                                    loss="ce",
-                                    ignore_index=-1,
-                                    lr=0.001,
-                                    freeze_backbone=False,
-                                    freeze_decoder=False,
-                                    plot_on_val=10,
-                                )
-                                signal.alarm(0)  # タイムアウトを解除
-                                
-                                status_text.text("✅ SemanticSegmentationTask初期化完了")
-                                progress_bar.progress(100)
-                                st.info("✅ SemanticSegmentationTask初期化完了")
-                                
-                            except TimeoutError:
-                                signal.alarm(0)  # タイムアウトを解除
-                                st.error("❌ モデル初期化がタイムアウトしました（60秒）")
-                                raise TimeoutError("モデル初期化タイムアウト")
-                            finally:
-                                signal.alarm(0)  # 確実にタイムアウトを解除
-                        else:
-                            # Windows等での通常初期化
-                            st.warning("⚠️ タイムアウト機能なしで初期化中...")
-                            model = SemanticSegmentationTask(
-                                model_args=model_args,
-                                model_factory="EncoderDecoderFactory",
-                                loss="ce",
-                                ignore_index=-1,
-                                lr=0.001,
-                                freeze_backbone=False,
-                                freeze_decoder=False,
-                                plot_on_val=10,
-                            )
-                            st.info("✅ SemanticSegmentationTask初期化完了")
-                            
+                        status_text.text("🔧 SemanticSegmentationTaskを作成中...")
+                        progress_bar.progress(30)
+                        
+                        # Streamlit環境では通常の初期化を実行
+                        st.info("🔄 Streamlit環境でモデル初期化中...")
+                        
+                        # PyTorchの設定を最適化
+                        torch.set_num_threads(1)  # CPUスレッド数を制限
+                        
+                        model = SemanticSegmentationTask(
+                            model_args=model_args,
+                            model_factory="EncoderDecoderFactory",
+                            loss="ce",
+                            ignore_index=-1,
+                            lr=0.001,
+                            freeze_backbone=False,
+                            freeze_decoder=False,
+                            plot_on_val=10,
+                        )
+                        
+                        status_text.text("✅ SemanticSegmentationTask初期化完了")
+                        progress_bar.progress(100)
+                        st.success("✅ SemanticSegmentationTask初期化完了")
+                        
                     except Exception as task_error:
                         st.error(f"❌ SemanticSegmentationTask初期化エラー: {task_error}")
-                        raise task_error
+                        st.error(f"詳細: {str(task_error)}")
+                        
+                        # 詳細なトレースバック情報
+                        import traceback
+                        st.error("スタックトレース:")
+                        st.code(traceback.format_exc())
+                        
+                        # メモリ不足の可能性がある場合の対処
+                        if "memory" in str(task_error).lower() or "out of memory" in str(task_error).lower():
+                            st.warning("🔄 メモリ不足の可能性があります。より軽量な設定で再試行中...")
+                            
+                            # 最小限の設定で再試行
+                            minimal_model_args = {
+                                "backbone": "prithvi_eo_v2_300_tl",
+                                "decoder": "UperNetDecoder",
+                                "num_classes": 2,
+                            }
+                            
+                            try:
+                                model = SemanticSegmentationTask(
+                                    model_args=minimal_model_args,
+                                    model_factory="EncoderDecoderFactory",
+                                    loss="ce",
+                                )
+                                st.success("✅ 軽量設定でのSemanticSegmentationTask初期化成功")
+                            except Exception as minimal_error:
+                                st.error(f"❌ 軽量設定でも失敗: {minimal_error}")
+                                st.warning("🔄 完全フォールバック: 独自実装モデルを使用")
+                                model = AdvancedPrithviModel()
+                                model.eval()
+                                st.warning("⚠️ 独自実装Prithviモデルで続行します")
+                        else:
+                            st.warning("🔄 完全フォールバック: 独自実装モデルを使用")
+                            model = AdvancedPrithviModel()
+                            model.eval()
+                            st.warning("⚠️ 独自実装Prithviモデルで続行します")
                     
                 except Exception as model_init_error:
                     st.error(f"❌ モデル初期化エラー: {model_init_error}")
