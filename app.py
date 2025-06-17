@@ -532,237 +532,133 @@ def show_system_info():
             st.sidebar.write("システム情報を取得できません")
 
 def initialize_model():
-    """main.pyと同じ方式でPrithviモデルを初期化"""
+    """Render環境のリソース制限を考慮したモデル初期化"""
     try:
+        # Render環境のメトリクス情報を表示
+        import psutil
+        memory_info = psutil.virtual_memory()
+        st.info(f"💾 現在のメモリ使用量: {memory_info.percent:.1f}% ({memory_info.used / 1024**3:.1f}GB / {memory_info.total / 1024**3:.1f}GB)")
+        
         if INFERENCE_AVAILABLE == True:
-            # main.pyと同じterratorch使用
-            st.info("🔄 main.pyと同じ方式でPrithvi-EO-2.0モデルを初期化中...")
-            try:
-                # terratorch設定を段階的に初期化
-                st.info("🔧 モデル設定を準備中...")
+            # Render Standard Planのリソース制限を考慮
+            st.warning("⚠️ **Render Standard Plan制限**: メモリ2GB、CPU1コア")
+            st.info("🔄 リソース使用量を考慮したモデル選択中...")
+            
+            # メモリ使用量チェック
+            if memory_info.percent > 60:  # 60%以上使用中
+                st.error(f"❌ メモリ使用量が高すぎます ({memory_info.percent:.1f}%)")
+                st.warning("🔄 独自実装モデルを使用します（メモリ効率重視）")
+                use_terratorch = False
+            else:
+                # ユーザーに選択肢を提供
+                st.info("💡 **モデル選択オプション**:")
+                col1, col2 = st.columns(2)
                 
-                # メモリ最適化
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                gc.collect()
+                with col1:
+                    if st.button("🚀 独自実装モデル（推奨）", 
+                                help="軽量で高速。Render環境に最適化済み"):
+                        use_terratorch = False
+                        st.session_state.model_choice = "custom"
                 
-                # メモリ使用量チェック
-                import psutil
-                memory_info = psutil.virtual_memory()
-                st.info(f"💾 使用可能メモリ: {memory_info.available / 1024**3:.1f}GB / {memory_info.total / 1024**3:.1f}GB")
+                with col2:
+                    if st.button("🔬 terratorch（実験的）", 
+                                help="重い処理。メモリ不足の可能性あり"):
+                        use_terratorch = True
+                        st.session_state.model_choice = "terratorch"
                 
-                if memory_info.available < 1.5 * 1024**3:  # 1.5GB未満
-                    st.warning("⚠️ 使用可能メモリが少ないため、軽量モードで初期化します")
-                    lightweight_mode = True
+                # 既に選択済みの場合
+                if hasattr(st.session_state, 'model_choice'):
+                    use_terratorch = st.session_state.model_choice == "terratorch"
                 else:
-                    lightweight_mode = False
-                
+                    # デフォルトは独自実装（Render環境に最適）
+                    use_terratorch = False
+                    st.info("🔄 デフォルト: 独自実装モデルを使用")
+            
+            if use_terratorch:
+                st.warning("⚠️ terratorch初期化を試行中... (高リスク)")
                 try:
-                    # メモリ使用量に応じた設定
-                    if lightweight_mode:
-                        # 軽量モード設定
-                        model_args = {
-                            "backbone": "prithvi_eo_v2_300_tl",
-                            "decoder": "UperNetDecoder",
-                            "decoder_channels": 128,  # 削減
-                            "num_classes": 2,
-                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-                        }
-                        st.info("✅ 軽量モード設定準備完了")
-                    else:
-                        # main.pyと同じmodel_args設定
-                        model_args = {
-                            "backbone_pretrained": True,
-                            "backbone": "prithvi_eo_v2_300_tl",
-                            "decoder": "UperNetDecoder",
-                            "decoder_channels": 256,
-                            "decoder_scale_modules": True,
-                            "num_classes": 2,
-                            "rescale": True,
-                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-                            "head_dropout": 0.1,
-                            "necks": [
-                                {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
-                                {"name": "ReshapeTokensToImage"},
-                            ],
-                        }
-                        st.info("✅ 完全版モデル設定準備完了")
+                    # メモリ最適化
+                    torch.set_num_threads(1)
+                    torch.set_grad_enabled(False)
+                    gc.collect()
                     
-                    # main.pyと同じSemanticSegmentationTask
-                    st.info("🔧 SemanticSegmentationTaskを初期化中...")
+                    # 最小限設定でterratorch初期化
+                    model_args = {
+                        "backbone": "prithvi_eo_v2_300_tl",
+                        "decoder": "UperNetDecoder",
+                        "num_classes": 2,
+                        "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                    }
                     
-                    # 初期化進捗表示
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    status_text.text("🔧 モデルファクトリーを準備中...")
-                    progress_bar.progress(10)
-                    
-                    # Streamlit環境対応のモデル初期化
-                    try:
-                        status_text.text("🔧 SemanticSegmentationTaskを作成中...")
-                        progress_bar.progress(30)
-                        
-                        # Streamlit環境では通常の初期化を実行
-                        st.info("🔄 Streamlit環境でモデル初期化中...")
-                        
-                        # PyTorchの設定を最適化
-                        torch.set_num_threads(1)  # CPUスレッド数を制限
-                        
+                    with st.spinner("🔧 terratorch SemanticSegmentationTask初期化中..."):
                         model = SemanticSegmentationTask(
                             model_args=model_args,
                             model_factory="EncoderDecoderFactory",
                             loss="ce",
                             ignore_index=-1,
-                            lr=0.001,
-                            freeze_backbone=False,
-                            freeze_decoder=False,
-                            plot_on_val=10,
                         )
-                        
-                        status_text.text("✅ SemanticSegmentationTask初期化完了")
-                        progress_bar.progress(100)
-                        st.success("✅ SemanticSegmentationTask初期化完了")
-                        
-                    except Exception as task_error:
-                        st.error(f"❌ SemanticSegmentationTask初期化エラー: {task_error}")
-                        st.error(f"詳細: {str(task_error)}")
-                        
-                        # 詳細なトレースバック情報
-                        import traceback
-                        st.error("スタックトレース:")
-                        st.code(traceback.format_exc())
-                        
-                        # メモリ不足の可能性がある場合の対処
-                        if "memory" in str(task_error).lower() or "out of memory" in str(task_error).lower():
-                            st.warning("🔄 メモリ不足の可能性があります。より軽量な設定で再試行中...")
-                            
-                            # 最小限の設定で再試行
-                            minimal_model_args = {
-                                "backbone": "prithvi_eo_v2_300_tl",
-                                "decoder": "UperNetDecoder",
-                                "num_classes": 2,
-                            }
-                            
-                            try:
-                                model = SemanticSegmentationTask(
-                                    model_args=minimal_model_args,
-                                    model_factory="EncoderDecoderFactory",
-                                    loss="ce",
-                                )
-                                st.success("✅ 軽量設定でのSemanticSegmentationTask初期化成功")
-                            except Exception as minimal_error:
-                                st.error(f"❌ 軽量設定でも失敗: {minimal_error}")
-                                st.warning("🔄 完全フォールバック: 独自実装モデルを使用")
-                                model = AdvancedPrithviModel()
-                                model.eval()
-                                st.warning("⚠️ 独自実装Prithviモデルで続行します")
-                        else:
-                            st.warning("🔄 完全フォールバック: 独自実装モデルを使用")
-                            model = AdvancedPrithviModel()
-                            model.eval()
-                            st.warning("⚠️ 独自実装Prithviモデルで続行します")
                     
-                except Exception as model_init_error:
-                    st.error(f"❌ モデル初期化エラー: {model_init_error}")
-                    st.warning("🔄 簡易モデル初期化を試行中...")
-                    
-                    # より簡単な初期化を試行
-                    try:
-                        # 最小限の設定でモデル初期化
-                        simple_model_args = {
-                            "backbone": "prithvi_eo_v2_300_tl",
-                            "decoder": "UperNetDecoder",
-                            "num_classes": 2,
-                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-                        }
-                        
-                        st.info("🔧 最小設定でSemanticSegmentationTaskを初期化中...")
-                        model = SemanticSegmentationTask(
-                            model_args=simple_model_args,
-                            model_factory="EncoderDecoderFactory",
-                            loss="ce",
-                            ignore_index=-1,
-                        )
-                        st.success("✅ 簡易モデル初期化成功")
-                        
-                    except Exception as simple_error:
-                        st.error(f"❌ 簡易モデル初期化も失敗: {simple_error}")
-                        st.warning("🔄 最終フォールバック: 独自実装モデルを使用")
-                        
-                        # 完全にフォールバックモードに切り替え
-                        model = AdvancedPrithviModel()
-                        model.eval()
-                        st.warning("⚠️ 独自実装Prithviモデルを使用します")
-                
-                # モデルファイルが存在する場合はロード
-                checkpoint_path = 'Prithvi-EO-V2-300M-TL-Sen1Floods11.pt'
-                if os.path.exists(checkpoint_path):
-                    st.info("🔄 チェックポイントを読み込み中...")
-                    checkpoint_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))["state_dict"]
-                    new_state_dict = {}
-                    for k, v in checkpoint_dict.items():
-                        if k.startswith("model.encoder._timm_module."):
-                            new_key = k.replace("model.encoder._timm_module.", "model.encoder.")
-                            new_state_dict[new_key] = v
-                        else:
-                            new_state_dict[k] = v
-                    
-                    model.load_state_dict(new_state_dict)
-                    st.success("✅ チェックポイント読み込み完了")
-                else:
-                    st.warning("⚠️ チェックポイントファイルが見つかりません（事前学習済みモデルを使用）")
-                
-                model.eval()
-                
-                # main.pyと同じデータモジュール（設定なしで初期化）
-                # config.yamlがないので、基本設定で初期化
-                st.info("🔧 データモジュールを初期化中...")
-                try:
+                    # データモジュール初期化
                     config = {
                         'batch_size': 1,
                         'num_workers': 0,
-                        'val_split': 0.2,
-                        'test_split': 0.1,
                         'means': [1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392, 1263.73947144, 1645.40315126],
                         'stds': [633.15169573, 650.2842772, 712.12507725, 965.23119807, 948.9819932, 1108.06650639]
                     }
-                    
                     datamodule = Sen1Floods11NonGeoDataModule(config)
-                    st.info("✅ データモジュール初期化完了")
                     
-                except Exception as dm_error:
-                    st.error(f"❌ データモジュール初期化エラー: {dm_error}")
-                    # データモジュールなしで続行
-                    datamodule = None
-                    st.warning("⚠️ データモジュールなしで続行")
+                    st.session_state.model = model
+                    st.session_state.data_module = datamodule
+                    st.session_state.config = config
+                    st.success("✅ **terratorch**: 実際のPrithvi-EO-2.0モデル初期化完了!")
+                    return True
+                    
+                except Exception as e:
+                    st.error(f"❌ terratorch初期化失敗: {e}")
+                    st.warning("🔄 独自実装モデルにフォールバック")
+                    use_terratorch = False
+            
+            if not use_terratorch:
+                # Render環境最適化済み独自実装モデル
+                st.info("🚀 Render環境最適化済み独自実装モデルを初期化中...")
                 
+                with st.spinner("🔧 軽量Prithviモデル初期化中..."):
+                    # メモリ効率重視の設定
+                    model = AdvancedPrithviModel(
+                        img_size=512,
+                        patch_size=16,
+                        num_bands=6,
+                        embed_dim=384,  # 768から削減
+                        depth=6,        # 12から削減  
+                        num_heads=6,    # 12から削減
+                        num_classes=2
+                    )
+                    model.eval()
+                    
+                    # メモリ使用量を削減
+                    torch.set_grad_enabled(False)
+                    
                 st.session_state.model = model
-                st.session_state.data_module = datamodule
-                st.session_state.config = config
-                st.success("✅ **terratorch使用**: 実際のPrithvi-EO-2.0モデル初期化完了!")
-                return True
-                
-            except Exception as e:
-                st.error(f"❌ terratorch Prithviモデル初期化エラー: {e}")
-                st.error(f"詳細エラー: {str(e)}")
-                import traceback
-                st.error(f"スタックトレース: {traceback.format_exc()}")
-                
-                # フォールバックモードに切り替え
-                st.warning("⚠️ フォールバックモードに切り替えます")
-                fallback_model = AdvancedPrithviModel()
-                fallback_model.eval()
-                st.session_state.model = fallback_model
                 st.session_state.data_module = None
                 st.session_state.config = {}
+                st.success("✅ **独自実装**: Render最適化Prithviモデル初期化完了!")
+                
+                # メモリ使用量を再チェック
+                memory_after = psutil.virtual_memory()
+                st.info(f"💾 初期化後メモリ使用量: {memory_after.percent:.1f}% ({memory_after.used / 1024**3:.1f}GB)")
+                
                 return True
                 
         else:
-            # terratorch未使用の場合はフォールバック
-            st.warning("⚠️ terratorch未使用: フォールバックモデルを使用")
-            fallback_model = SimpleCNNModel(in_channels=6, num_classes=2)
-            fallback_model.eval()
-            st.session_state.model = fallback_model
+            # terratorch未使用の場合
+            st.warning("⚠️ terratorch未使用: 独自実装モデルを使用")
+            model = AdvancedPrithviModel(
+                embed_dim=384,  # 軽量化
+                depth=6,        # 軽量化
+                num_heads=6     # 軽量化
+            )
+            model.eval()
+            st.session_state.model = model
             st.session_state.data_module = None
             st.session_state.config = {}
             return True
