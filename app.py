@@ -541,38 +541,119 @@ def initialize_model():
                 # terratorch設定を段階的に初期化
                 st.info("🔧 モデル設定を準備中...")
                 
+                # メモリ最適化
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                gc.collect()
+                
+                # メモリ使用量チェック
+                import psutil
+                memory_info = psutil.virtual_memory()
+                st.info(f"💾 使用可能メモリ: {memory_info.available / 1024**3:.1f}GB / {memory_info.total / 1024**3:.1f}GB")
+                
+                if memory_info.available < 1.5 * 1024**3:  # 1.5GB未満
+                    st.warning("⚠️ 使用可能メモリが少ないため、軽量モードで初期化します")
+                    lightweight_mode = True
+                else:
+                    lightweight_mode = False
+                
                 try:
-                    # main.pyと同じmodel_args設定
-                    model_args = {
-                        "backbone_pretrained": True,
-                        "backbone": "prithvi_eo_v2_300_tl",
-                        "decoder": "UperNetDecoder",
-                        "decoder_channels": 256,
-                        "decoder_scale_modules": True,
-                        "num_classes": 2,
-                        "rescale": True,
-                        "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-                        "head_dropout": 0.1,
-                        "necks": [
-                            {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
-                            {"name": "ReshapeTokensToImage"},
-                        ],
-                    }
-                    st.info("✅ モデル設定準備完了")
+                    # メモリ使用量に応じた設定
+                    if lightweight_mode:
+                        # 軽量モード設定
+                        model_args = {
+                            "backbone": "prithvi_eo_v2_300_tl",
+                            "decoder": "UperNetDecoder",
+                            "decoder_channels": 128,  # 削減
+                            "num_classes": 2,
+                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                        }
+                        st.info("✅ 軽量モード設定準備完了")
+                    else:
+                        # main.pyと同じmodel_args設定
+                        model_args = {
+                            "backbone_pretrained": True,
+                            "backbone": "prithvi_eo_v2_300_tl",
+                            "decoder": "UperNetDecoder",
+                            "decoder_channels": 256,
+                            "decoder_scale_modules": True,
+                            "num_classes": 2,
+                            "rescale": True,
+                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                            "head_dropout": 0.1,
+                            "necks": [
+                                {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
+                                {"name": "ReshapeTokensToImage"},
+                            ],
+                        }
+                        st.info("✅ 完全版モデル設定準備完了")
                     
                     # main.pyと同じSemanticSegmentationTask
                     st.info("🔧 SemanticSegmentationTaskを初期化中...")
-                    model = SemanticSegmentationTask(
-                        model_args=model_args,
-                        model_factory="EncoderDecoderFactory",
-                        loss="ce",
-                        ignore_index=-1,
-                        lr=0.001,
-                        freeze_backbone=False,
-                        freeze_decoder=False,
-                        plot_on_val=10,
-                    )
-                    st.info("✅ SemanticSegmentationTask初期化完了")
+                    
+                    # 初期化進捗表示
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    status_text.text("🔧 モデルファクトリーを準備中...")
+                    progress_bar.progress(10)
+                    
+                    # プラットフォーム対応のモデル初期化
+                    try:
+                        # Linux/Unix系でのタイムアウト付き初期化
+                        if os.name == 'posix':
+                            import signal
+                            
+                            def timeout_handler(signum, frame):
+                                raise TimeoutError("モデル初期化がタイムアウトしました")
+                            
+                            # 60秒でタイムアウト
+                            signal.signal(signal.SIGALRM, timeout_handler)
+                            signal.alarm(60)
+                            
+                            try:
+                                status_text.text("🔧 SemanticSegmentationTaskを作成中...")
+                                progress_bar.progress(30)
+                                
+                                model = SemanticSegmentationTask(
+                                    model_args=model_args,
+                                    model_factory="EncoderDecoderFactory",
+                                    loss="ce",
+                                    ignore_index=-1,
+                                    lr=0.001,
+                                    freeze_backbone=False,
+                                    freeze_decoder=False,
+                                    plot_on_val=10,
+                                )
+                                signal.alarm(0)  # タイムアウトを解除
+                                
+                                status_text.text("✅ SemanticSegmentationTask初期化完了")
+                                progress_bar.progress(100)
+                                st.info("✅ SemanticSegmentationTask初期化完了")
+                                
+                            except TimeoutError:
+                                signal.alarm(0)  # タイムアウトを解除
+                                st.error("❌ モデル初期化がタイムアウトしました（60秒）")
+                                raise TimeoutError("モデル初期化タイムアウト")
+                            finally:
+                                signal.alarm(0)  # 確実にタイムアウトを解除
+                        else:
+                            # Windows等での通常初期化
+                            st.warning("⚠️ タイムアウト機能なしで初期化中...")
+                            model = SemanticSegmentationTask(
+                                model_args=model_args,
+                                model_factory="EncoderDecoderFactory",
+                                loss="ce",
+                                ignore_index=-1,
+                                lr=0.001,
+                                freeze_backbone=False,
+                                freeze_decoder=False,
+                                plot_on_val=10,
+                            )
+                            st.info("✅ SemanticSegmentationTask初期化完了")
+                            
+                    except Exception as task_error:
+                        st.error(f"❌ SemanticSegmentationTask初期化エラー: {task_error}")
+                        raise task_error
                     
                 except Exception as model_init_error:
                     st.error(f"❌ モデル初期化エラー: {model_init_error}")
@@ -588,6 +669,7 @@ def initialize_model():
                             "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
                         }
                         
+                        st.info("🔧 最小設定でSemanticSegmentationTaskを初期化中...")
                         model = SemanticSegmentationTask(
                             model_args=simple_model_args,
                             model_factory="EncoderDecoderFactory",
@@ -598,7 +680,12 @@ def initialize_model():
                         
                     except Exception as simple_error:
                         st.error(f"❌ 簡易モデル初期化も失敗: {simple_error}")
-                        raise simple_error
+                        st.warning("🔄 最終フォールバック: 独自実装モデルを使用")
+                        
+                        # 完全にフォールバックモードに切り替え
+                        model = AdvancedPrithviModel()
+                        model.eval()
+                        st.warning("⚠️ 独自実装Prithviモデルを使用します")
                 
                 # モデルファイルが存在する場合はロード
                 checkpoint_path = 'Prithvi-EO-V2-300M-TL-Sen1Floods11.pt'
