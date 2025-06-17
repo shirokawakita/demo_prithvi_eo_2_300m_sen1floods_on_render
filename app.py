@@ -553,31 +553,33 @@ def create_sentinel2_rgb_display(processed_tensor):
         # image_processor.pyと同じ方法でRGB作成
         # バンド順序: [BLUE(0), GREEN(1), RED(2), NIR(3), SWIR1(4), SWIR2(5)]
         # RGB表示: RED(2), GREEN(1), BLUE(0)
-        rgb_bands = np.stack([
-            bands_data[2],  # Red
-            bands_data[1],  # Green  
-            bands_data[0]   # Blue
-        ], axis=-1)
+        red_band = bands_data[2]    # (512, 512)
+        green_band = bands_data[1]  # (512, 512)
+        blue_band = bands_data[0]   # (512, 512)
         
-        # (512, 512, 3)の形状に変換
-        rgb_bands = rgb_bands.transpose(1, 2, 0)
+        # RGB画像を作成: (512, 512, 3)
+        rgb_image = np.stack([red_band, green_band, blue_band], axis=-1)
         
         # image_processor.pyと同じ正規化方法
         # 0-255に正規化
-        rgb_min = rgb_bands.min()
-        rgb_max = rgb_bands.max()
+        rgb_min = rgb_image.min()
+        rgb_max = rgb_image.max()
         
         if rgb_max > rgb_min:
-            rgb_normalized = ((rgb_bands - rgb_min) / (rgb_max - rgb_min) * 255)
+            rgb_normalized = ((rgb_image - rgb_min) / (rgb_max - rgb_min) * 255)
         else:
-            rgb_normalized = rgb_bands * 255
-            
-        rgb_image = np.clip(rgb_normalized, 0, 255).astype(np.uint8)
+            rgb_normalized = rgb_image * 255
+             
+        rgb_result = np.clip(rgb_normalized, 0, 255).astype(np.uint8)
         
-        return rgb_image
+        # 形状確認
+        st.info(f"🔍 RGB画像形状: {rgb_result.shape}")
+        
+        return rgb_result
         
     except Exception as e:
         st.warning(f"⚠️ Sentinel-2 RGB作成エラー: {e}")
+        st.error(f"🔍 デバッグ情報: processed_tensor.shape = {processed_tensor.shape}")
         return None
 
 def preprocess_image_standalone(img_array):
@@ -907,6 +909,7 @@ def main():
                         display_rgb_image = sentinel2_rgb
                         st.info("🛰️ Sentinel-2バンド合成表示を使用")
                     else:
+                        st.warning("⚠️ Sentinel-2 RGB作成に失敗、元画像を使用")
                         display_rgb_image = rgb_image
                         st.info("📷 元画像を使用")
                         
@@ -914,6 +917,7 @@ def main():
                     st.error(f"❌ 前処理エラー: {preprocess_error}")
                     processed_tensor = None
                     display_rgb_image = rgb_image
+                    st.warning("⚠️ 前処理に失敗、元画像を使用")
             
             # 入力画像プレビュー
             st.subheader("🖼️ 入力画像プレビュー")
@@ -935,6 +939,11 @@ def main():
             
             if predict_button and processed_tensor is not None:
                 try:
+                    # display_rgb_imageが存在しない場合は元画像を使用
+                    if 'display_rgb_image' not in locals():
+                        display_rgb_image = rgb_image
+                        st.info("📷 元画像を使用して推論を実行")
+                    
                     with st.spinner("🔮 洪水検出を実行中..."):
                         # 現実的な洪水検出を実行
                         flood_mask, flood_prob = create_realistic_flood_prediction(
