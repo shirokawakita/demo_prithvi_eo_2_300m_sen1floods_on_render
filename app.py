@@ -697,6 +697,61 @@ def create_prediction_overlay(rgb_image, flood_mask):
     result = cv2.addWeighted(rgb_image, 1-alpha, overlay, alpha, 0)
     return result
 
+def create_sentinel2_rgb_display(processed_tensor):
+    """Sentinel-2データから適切なRGB表示画像を作成"""
+    try:
+        # processed_tensorから元の6バンドデータを取得
+        # 正規化を逆変換
+        mean = torch.tensor([429.9430, 614.21682446, 590.23569706, 
+                           2218.94553375, 950.68368468, 792.18161926]).view(1, 6, 1, 1)
+        std = torch.tensor([572.41639287, 582.87945694, 675.88746967, 
+                          1365.45589904, 729.89827633, 635.49894291]).view(1, 6, 1, 1)
+        
+        # 正規化を逆変換してSentinel-2の生値に戻す
+        denormalized = processed_tensor * std + mean
+        denormalized = torch.clamp(denormalized, 0, 10000)  # Sentinel-2の範囲
+        
+        # バンド選択: [Blue, Green, Red, NIR, SWIR1, SWIR2]
+        # RGB表示用にRed(2), Green(1), Blue(0)を選択
+        rgb_bands = denormalized[0, [2, 1, 0], :, :].cpu().numpy()  # Red, Green, Blue
+        
+        # 値域調整: 0-10000 → 0-255
+        # パーセンタイル調整で自然な見た目に
+        rgb_display = np.zeros((512, 512, 3), dtype=np.uint8)
+        
+        for i in range(3):
+            band = rgb_bands[i]
+            # 2-98パーセンタイルで値域調整（コントラスト改善）
+            p2, p98 = np.percentile(band, (2, 98))
+            band_stretched = np.clip((band - p2) / (p98 - p2) * 255, 0, 255)
+            rgb_display[:, :, i] = band_stretched.astype(np.uint8)
+        
+        return rgb_display
+        
+    except Exception as e:
+        st.warning(f"⚠️ Sentinel-2 RGB作成エラー: {e}")
+        # フォールバック: 元のrgb_imageを使用
+        return None
+
+def enhance_satellite_image_display(rgb_image):
+    """衛星画像の表示を改善"""
+    try:
+        # ヒストグラム均等化でコントラスト改善
+        lab = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2LAB)
+        lab[:, :, 0] = cv2.equalizeHist(lab[:, :, 0])
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        # ガンマ補正で明度調整
+        gamma = 1.2
+        enhanced = np.power(enhanced / 255.0, 1/gamma) * 255
+        enhanced = enhanced.astype(np.uint8)
+        
+        return enhanced
+        
+    except Exception as e:
+        st.warning(f"⚠️ 画像強調エラー: {e}")
+        return rgb_image
+
 def main():
     st.title("🌊 Prithvi-EO-2.0 洪水検出システム（Standard Plan）")
     
@@ -878,18 +933,29 @@ def main():
             if predict_button and processed_tensor is not None:
                 try:
                     with st.spinner("🔮 洪水検出を実行中..."):
+                        # Sentinel-2の適切なRGB表示を作成
+                        sentinel2_rgb = create_sentinel2_rgb_display(processed_tensor)
+                        if sentinel2_rgb is not None:
+                            # Sentinel-2の適切な表示を使用
+                            display_image = enhance_satellite_image_display(sentinel2_rgb)
+                            st.info("✅ Sentinel-2 RGB表示を使用（Red, Green, Blue バンド）")
+                        else:
+                            # フォールバック: 元の画像を使用
+                            display_image = rgb_image
+                            st.info("ℹ️ 元画像を使用")
+                        
                         # 現実的な洪水検出を実行
                         flood_mask, flood_prob = create_realistic_flood_prediction(
-                            rgb_image, processed_tensor, st.session_state.model
+                            display_image, processed_tensor, st.session_state.model
                         )
                         
                         # 予測マスク画像を作成（白黒）
-                        prediction_image = np.zeros_like(rgb_image)
+                        prediction_image = np.zeros_like(display_image)
                         prediction_image[flood_mask] = [255, 255, 255]  # 洪水=白
                         # 非洪水エリアは黒のまま（0, 0, 0）
                         
                         # オーバーレイ画像を作成
-                        overlay_image = create_prediction_overlay(rgb_image, flood_mask)
+                        overlay_image = create_prediction_overlay(display_image, flood_mask)
                         
                         # 統計計算
                         total_pixels = flood_mask.size
@@ -905,7 +971,7 @@ def main():
                         
                         with col1:
                             st.markdown("**Input Image**")
-                            st.image(rgb_image, use_column_width=True)
+                            st.image(display_image, use_column_width=True)
                             
                         with col2:
                             st.markdown("**Prediction**")
@@ -940,9 +1006,9 @@ def main():
                         col1, col2, col3 = st.columns(3)
                         
                         with col1:
-                            # 入力画像ダウンロード
+                            # 入力画像ダウンロード（Sentinel-2 RGB）
                             img_buffer = io.BytesIO()
-                            Image.fromarray(rgb_image).save(img_buffer, format='PNG')
+                            Image.fromarray(display_image).save(img_buffer, format='PNG')
                             st.download_button(
                                 label="入力画像をダウンロード",
                                 data=img_buffer.getvalue(),
