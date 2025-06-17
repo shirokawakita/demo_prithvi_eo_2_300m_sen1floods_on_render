@@ -544,34 +544,35 @@ def initialize_model():
         return False
 
 def create_sentinel2_rgb_display(processed_tensor):
-    """inference.pyに基づくSentinel-2 RGB表示作成"""
+    """image_processor.pyに基づくシンプルなRGB表示作成"""
     try:
-        # processed_tensorから正規化を逆変換
-        mean = torch.tensor([429.9430, 614.21682446, 590.23569706, 
-                           2218.94553375, 950.68368468, 792.18161926]).view(1, 6, 1, 1)
-        std = torch.tensor([572.41639287, 582.87945694, 675.88746967, 
-                          1365.45589904, 729.89827633, 635.49894291]).view(1, 6, 1, 1)
+        # processed_tensorから生データを取得
+        # バッチ次元を除去: (1, 6, 512, 512) -> (6, 512, 512)
+        bands_data = processed_tensor[0].cpu().numpy()
         
-        # 正規化を逆変換してSentinel-2の生値に戻す
-        denormalized = processed_tensor * std + mean
-        denormalized = torch.clamp(denormalized, 0, 10000)
+        # image_processor.pyと同じ方法でRGB作成
+        # バンド順序: [BLUE(0), GREEN(1), RED(2), NIR(3), SWIR1(4), SWIR2(5)]
+        # RGB表示: RED(2), GREEN(1), BLUE(0)
+        rgb_bands = np.stack([
+            bands_data[2],  # Red
+            bands_data[1],  # Green  
+            bands_data[0]   # Blue
+        ], axis=-1)
         
-        # inference.pyと同じバンド順序でRGB表示
-        # バンド配列: [BLUE(1), GREEN(2), RED(3), NIR_NARROW(8), SWIR_1(11), SWIR_2(12)]
-        # RGB表示用: RED(index=2), GREEN(index=1), BLUE(index=0)
-        rgb_bands = denormalized[0, [2, 1, 0], :, :].cpu().numpy()  # RED, GREEN, BLUE
+        # (512, 512, 3)の形状に変換
+        rgb_bands = rgb_bands.transpose(1, 2, 0)
         
-        # inference.pyと同じ正規化方法
-        rgb_image = np.zeros((512, 512, 3), dtype=np.uint8)
-        for i in range(3):
-            band = rgb_bands[i]
-            # inference.pyと同じ2-98パーセンタイル調整
-            p2, p98 = np.percentile(band, (2, 98))
-            if p98 > p2:  # ゼロ除算を避ける
-                band_norm = np.clip((band - p2) / (p98 - p2) * 255, 0, 255)
-            else:
-                band_norm = np.clip(band * 255 / band.max() if band.max() > 0 else band, 0, 255)
-            rgb_image[:, :, i] = band_norm.astype(np.uint8)
+        # image_processor.pyと同じ正規化方法
+        # 0-255に正規化
+        rgb_min = rgb_bands.min()
+        rgb_max = rgb_bands.max()
+        
+        if rgb_max > rgb_min:
+            rgb_normalized = ((rgb_bands - rgb_min) / (rgb_max - rgb_min) * 255)
+        else:
+            rgb_normalized = rgb_bands * 255
+            
+        rgb_image = np.clip(rgb_normalized, 0, 255).astype(np.uint8)
         
         return rgb_image
         
@@ -580,35 +581,33 @@ def create_sentinel2_rgb_display(processed_tensor):
         return None
 
 def preprocess_image_standalone(img_array):
-    """inference.pyに基づく前処理（Sentinel-2標準）"""
+    """image_processor.pyに基づくシンプルな前処理"""
     try:
         if img_array.shape[-1] == 3:  # RGB image
-            # RGB to 6-band simulation (Sentinel-2のバンド1,2,3,8,11,12をシミュレーション)
+            # RGB to 6-band simulation
             rgb_array = img_array.astype(np.float32)
             
-            # inference.pyのバンド選択に合わせて6バンドを作成
-            # [BLUE(1), GREEN(2), RED(3), NIR_NARROW(8), SWIR_1(11), SWIR_2(12)]
-            blue = rgb_array[:, :, 2]    # B channel → BLUE(1)
-            green = rgb_array[:, :, 1]   # G channel → GREEN(2)
-            red = rgb_array[:, :, 0]     # R channel → RED(3)
-            nir = np.clip(1.0 - red/255.0, 0, 1) * 255  # Simulate NIR_NARROW(8)
-            swir1 = np.clip(green * 0.8, 0, 255)        # Simulate SWIR_1(11)
-            swir2 = np.clip(blue * 0.7, 0, 255)         # Simulate SWIR_2(12)
+            # image_processor.pyのバンドマッピングに合わせて6バンドを作成
+            # [BLUE(B2), GREEN(B3), RED(B4), NIR_NARROW(B8A), SWIR1(B11), SWIR2(B12)]
+            blue = rgb_array[:, :, 2]    # B channel → BLUE(B2)
+            green = rgb_array[:, :, 1]   # G channel → GREEN(B3)
+            red = rgb_array[:, :, 0]     # R channel → RED(B4)
+            
+            # NIRとSWIRをシミュレーション
+            nir = np.clip(255 - red, 0, 255)        # Simulate NIR_NARROW(B8A)
+            swir1 = np.clip(green * 0.8, 0, 255)    # Simulate SWIR1(B11)
+            swir2 = np.clip(blue * 0.7, 0, 255)     # Simulate SWIR2(B12)
             
             # Stack to create 6-band data
             bands = np.stack([blue, green, red, nir, swir1, swir2], axis=-1)
         else:
             bands = img_array.astype(np.float32)
-            if bands.max() > 1.0:
-                bands = bands
         
         # Ensure 6 bands
         if bands.shape[-1] != 6:
             if bands.shape[-1] == 3:
-                # Duplicate channels to create 6-band
                 bands = np.concatenate([bands, bands], axis=-1)
             else:
-                # Pad or truncate to 6 bands
                 target_bands = 6
                 if bands.shape[-1] < target_bands:
                     pad_bands = target_bands - bands.shape[-1]
@@ -617,7 +616,7 @@ def preprocess_image_standalone(img_array):
                 else:
                     bands = bands[:, :, :target_bands]
         
-        # Resize to 512x512
+        # Resize to 512x512 (image_processor.pyと同じ)
         h, w = bands.shape[:2]
         if h != 512 or w != 512:
             resized_bands = []
@@ -627,22 +626,20 @@ def preprocess_image_standalone(img_array):
                 resized_bands.append(resized_band)
             bands = np.stack(resized_bands, axis=-1)
         
-        # inference.pyに基づく正規化
-        # まず平均と標準偏差で正規化（inference.pyのload_example関数と同様）
-        bands = bands.astype(np.float32)
-        
-        # バンドごとに正規化
-        normalized_bands = np.zeros_like(bands)
-        for i in range(6):
-            band = bands[:, :, i]
-            mean_val = band.mean()
-            std_val = band.std() + 1e-6
-            normalized_bands[:, :, i] = (band - mean_val) / std_val
+        # image_processor.pyと同じ正規化方法を修正
+        # RGB画像の場合は0-255の値域なので、適切に調整
+        if img_array.shape[-1] == 3:  # 元がRGB画像の場合
+            # 0-255の値域を0-1に正規化
+            bands = bands / 255.0
+        else:
+            # Sentinel-2データの場合は1000-3000に調整してから0-1に正規化
+            bands = np.clip(bands, 1000, 3000)
+            bands = (bands - 1000) / 2000.0  # 0-1に正規化
         
         # Convert to tensor format: (batch, channels, height, width)
-        tensor = torch.from_numpy(normalized_bands).float()
-        tensor = tensor.permute(2, 0, 1)  # (C, H, W)
-        tensor = tensor.unsqueeze(0)      # (1, C, H, W)
+        tensor = torch.from_numpy(bands).float()
+        tensor = tensor.permute(2, 0, 1)  # (6, 512, 512)
+        tensor = tensor.unsqueeze(0)      # (1, 6, 512, 512)
         
         return tensor
         
