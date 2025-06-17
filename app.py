@@ -543,28 +543,64 @@ def initialize_model():
         st.error(f"❌ モデル初期化全体エラー: {e}")
         return False
 
+def create_sentinel2_rgb_display(processed_tensor):
+    """inference.pyに基づくSentinel-2 RGB表示作成"""
+    try:
+        # processed_tensorから正規化を逆変換
+        mean = torch.tensor([429.9430, 614.21682446, 590.23569706, 
+                           2218.94553375, 950.68368468, 792.18161926]).view(1, 6, 1, 1)
+        std = torch.tensor([572.41639287, 582.87945694, 675.88746967, 
+                          1365.45589904, 729.89827633, 635.49894291]).view(1, 6, 1, 1)
+        
+        # 正規化を逆変換してSentinel-2の生値に戻す
+        denormalized = processed_tensor * std + mean
+        denormalized = torch.clamp(denormalized, 0, 10000)
+        
+        # inference.pyと同じバンド順序でRGB表示
+        # バンド配列: [BLUE(1), GREEN(2), RED(3), NIR_NARROW(8), SWIR_1(11), SWIR_2(12)]
+        # RGB表示用: RED(index=2), GREEN(index=1), BLUE(index=0)
+        rgb_bands = denormalized[0, [2, 1, 0], :, :].cpu().numpy()  # RED, GREEN, BLUE
+        
+        # inference.pyと同じ正規化方法
+        rgb_image = np.zeros((512, 512, 3), dtype=np.uint8)
+        for i in range(3):
+            band = rgb_bands[i]
+            # inference.pyと同じ2-98パーセンタイル調整
+            p2, p98 = np.percentile(band, (2, 98))
+            if p98 > p2:  # ゼロ除算を避ける
+                band_norm = np.clip((band - p2) / (p98 - p2) * 255, 0, 255)
+            else:
+                band_norm = np.clip(band * 255 / band.max() if band.max() > 0 else band, 0, 255)
+            rgb_image[:, :, i] = band_norm.astype(np.uint8)
+        
+        return rgb_image
+        
+    except Exception as e:
+        st.warning(f"⚠️ Sentinel-2 RGB作成エラー: {e}")
+        return None
+
 def preprocess_image_standalone(img_array):
-    """Standard Plan独自前処理（terratorch無し）"""
+    """inference.pyに基づく前処理（Sentinel-2標準）"""
     try:
         if img_array.shape[-1] == 3:  # RGB image
-            # RGB to 6-band simulation (Sentinel-2風)
-            rgb_array = img_array.astype(np.float32) / 255.0
+            # RGB to 6-band simulation (Sentinel-2のバンド1,2,3,8,11,12をシミュレーション)
+            rgb_array = img_array.astype(np.float32)
             
-            # Simulate 6-band Sentinel-2 data
-            # [Blue, Green, Red, NIR, SWIR1, SWIR2]
-            blue = rgb_array[:, :, 2]    # B channel
-            green = rgb_array[:, :, 1]   # G channel  
-            red = rgb_array[:, :, 0]     # R channel
-            nir = np.clip(1.0 - red, 0, 1)  # Simulate NIR (inverse of red)
-            swir1 = np.clip(green * 0.8, 0, 1)  # Simulate SWIR1
-            swir2 = np.clip(blue * 0.7, 0, 1)   # Simulate SWIR2
+            # inference.pyのバンド選択に合わせて6バンドを作成
+            # [BLUE(1), GREEN(2), RED(3), NIR_NARROW(8), SWIR_1(11), SWIR_2(12)]
+            blue = rgb_array[:, :, 2]    # B channel → BLUE(1)
+            green = rgb_array[:, :, 1]   # G channel → GREEN(2)
+            red = rgb_array[:, :, 0]     # R channel → RED(3)
+            nir = np.clip(1.0 - red/255.0, 0, 1) * 255  # Simulate NIR_NARROW(8)
+            swir1 = np.clip(green * 0.8, 0, 255)        # Simulate SWIR_1(11)
+            swir2 = np.clip(blue * 0.7, 0, 255)         # Simulate SWIR_2(12)
             
             # Stack to create 6-band data
             bands = np.stack([blue, green, red, nir, swir1, swir2], axis=-1)
         else:
             bands = img_array.astype(np.float32)
             if bands.max() > 1.0:
-                bands = bands / 255.0
+                bands = bands
         
         # Ensure 6 bands
         if bands.shape[-1] != 6:
@@ -584,37 +620,29 @@ def preprocess_image_standalone(img_array):
         # Resize to 512x512
         h, w = bands.shape[:2]
         if h != 512 or w != 512:
-            # Resize each band
             resized_bands = []
             for i in range(6):
                 band = bands[:, :, i]
-                # Simple resize using nearest neighbor
                 resized_band = cv2.resize(band, (512, 512), interpolation=cv2.INTER_LINEAR)
                 resized_bands.append(resized_band)
             bands = np.stack(resized_bands, axis=-1)
         
-        # Scale to Sentinel-2 range (approximately 0-10000)
-        bands = bands * 10000
+        # inference.pyに基づく正規化
+        # まず平均と標準偏差で正規化（inference.pyのload_example関数と同様）
+        bands = bands.astype(np.float32)
         
-        # Convert to int16 (standard Sentinel-2 format)
-        bands = bands.astype(np.int16)
-        
-        # Ensure proper range
-        bands = np.clip(bands, 0, 10000)
+        # バンドごとに正規化
+        normalized_bands = np.zeros_like(bands)
+        for i in range(6):
+            band = bands[:, :, i]
+            mean_val = band.mean()
+            std_val = band.std() + 1e-6
+            normalized_bands[:, :, i] = (band - mean_val) / std_val
         
         # Convert to tensor format: (batch, channels, height, width)
-        tensor = torch.from_numpy(bands).float()
+        tensor = torch.from_numpy(normalized_bands).float()
         tensor = tensor.permute(2, 0, 1)  # (C, H, W)
         tensor = tensor.unsqueeze(0)      # (1, C, H, W)
-        
-        # Normalize for Prithvi model (based on Sentinel-2 statistics)
-        # Typical Sentinel-2 normalization
-        mean = torch.tensor([429.9430, 614.21682446, 590.23569706, 
-                           2218.94553375, 950.68368468, 792.18161926]).view(1, 6, 1, 1)
-        std = torch.tensor([572.41639287, 582.87945694, 675.88746967, 
-                          1365.45589904, 729.89827633, 635.49894291]).view(1, 6, 1, 1)
-        
-        tensor = (tensor - mean) / std
         
         return tensor
         
@@ -623,14 +651,12 @@ def preprocess_image_standalone(img_array):
         # Fallback: simple preprocessing
         if len(img_array.shape) == 3:
             if img_array.shape[-1] == 3:
-                # Simple RGB to 6-band
                 bands = np.concatenate([img_array, img_array], axis=-1)
             else:
                 bands = img_array
         else:
             bands = img_array
             
-        # Resize
         bands = cv2.resize(bands, (512, 512))
         if len(bands.shape) == 2:
             bands = np.expand_dims(bands, -1)
@@ -696,42 +722,6 @@ def create_prediction_overlay(rgb_image, flood_mask):
     alpha = 0.6
     result = cv2.addWeighted(rgb_image, 1-alpha, overlay, alpha, 0)
     return result
-
-def create_sentinel2_rgb_display(processed_tensor):
-    """Sentinel-2データから適切なRGB表示画像を作成"""
-    try:
-        # processed_tensorから元の6バンドデータを取得
-        # 正規化を逆変換
-        mean = torch.tensor([429.9430, 614.21682446, 590.23569706, 
-                           2218.94553375, 950.68368468, 792.18161926]).view(1, 6, 1, 1)
-        std = torch.tensor([572.41639287, 582.87945694, 675.88746967, 
-                          1365.45589904, 729.89827633, 635.49894291]).view(1, 6, 1, 1)
-        
-        # 正規化を逆変換してSentinel-2の生値に戻す
-        denormalized = processed_tensor * std + mean
-        denormalized = torch.clamp(denormalized, 0, 10000)  # Sentinel-2の範囲
-        
-        # バンド選択: [Blue, Green, Red, NIR, SWIR1, SWIR2]
-        # RGB表示用にRed(2), Green(1), Blue(0)を選択
-        rgb_bands = denormalized[0, [2, 1, 0], :, :].cpu().numpy()  # Red, Green, Blue
-        
-        # 値域調整: 0-10000 → 0-255
-        # パーセンタイル調整で自然な見た目に
-        rgb_display = np.zeros((512, 512, 3), dtype=np.uint8)
-        
-        for i in range(3):
-            band = rgb_bands[i]
-            # 2-98パーセンタイルで値域調整（コントラスト改善）
-            p2, p98 = np.percentile(band, (2, 98))
-            band_stretched = np.clip((band - p2) / (p98 - p2) * 255, 0, 255)
-            rgb_display[:, :, i] = band_stretched.astype(np.uint8)
-        
-        return rgb_display
-        
-    except Exception as e:
-        st.warning(f"⚠️ Sentinel-2 RGB作成エラー: {e}")
-        # フォールバック: 元のrgb_imageを使用
-        return None
 
 def enhance_satellite_image_display(rgb_image):
     """衛星画像の表示を改善"""
@@ -894,27 +884,43 @@ def main():
             
             st.success("✅ 画像処理完了!")
             
-            # 入力画像プレビュー
-            st.subheader("🖼️ 入力画像プレビュー")
-            col1, col2 = st.columns([2, 1])
+            # 画像情報表示
+            st.subheader("📷 画像情報")
+            col1, col2 = st.columns(2)
             
             with col1:
-                st.image(rgb_image, caption="RGB合成画像 (バンド3,2,1)", use_column_width=True)
-            
+                st.write("**基本情報**:")
+                st.write(f"- サイズ: {rgb_image.shape[1]}x{rgb_image.shape[0]}")
+                st.write(f"- チャンネル数: {rgb_image.shape[2] if len(rgb_image.shape) > 2 else 1}")
+                st.write(f"- データ型: {rgb_image.dtype}")
+                st.write(f"- 値域: {rgb_image.min()} - {rgb_image.max()}")
+                
             with col2:
-                st.markdown("**画像情報**")
-                st.write(f"- サイズ: {processed_data.shape[1]}×{processed_data.shape[2]}")
-                st.write(f"- バンド数: {processed_data.shape[0]}")
-                st.write(f"- データ型: {processed_data.dtype}")
-                st.write(f"- 値域: {processed_data.min():.3f} - {processed_data.max():.3f}")
+                st.write("**処理情報**:")
+                # 画像前処理（バックグラウンド処理）
+                try:
+                    processed_tensor = preprocess_image_standalone(rgb_image)
+                    st.success(f"✅ 前処理完了: {processed_tensor.shape}")
+                    
+                    # Sentinel-2 RGB表示を作成
+                    sentinel2_rgb = create_sentinel2_rgb_display(processed_tensor)
+                    if sentinel2_rgb is not None:
+                        st.success("✅ Sentinel-2 RGB表示作成完了")
+                        # プレビュー用に表示画像を更新
+                        display_rgb_image = sentinel2_rgb
+                        st.info("🛰️ Sentinel-2バンド合成表示を使用")
+                    else:
+                        display_rgb_image = rgb_image
+                        st.info("📷 元画像を使用")
+                        
+                except Exception as preprocess_error:
+                    st.error(f"❌ 前処理エラー: {preprocess_error}")
+                    processed_tensor = None
+                    display_rgb_image = rgb_image
             
-            # 画像前処理（バックグラウンド処理）
-            try:
-                processed_tensor = preprocess_image_standalone(rgb_image)
-                st.success(f"✅ 前処理完了: {processed_tensor.shape}")
-            except Exception as preprocess_error:
-                st.error(f"❌ 前処理エラー: {preprocess_error}")
-                processed_tensor = None
+            # 入力画像プレビュー
+            st.subheader("🖼️ 入力画像プレビュー")
+            st.image(display_rgb_image, caption="処理済みSentinel-2 RGB画像", use_column_width=True)
             
             # 予測実行
             st.header("🧠 AI洪水検出")
@@ -933,29 +939,18 @@ def main():
             if predict_button and processed_tensor is not None:
                 try:
                     with st.spinner("🔮 洪水検出を実行中..."):
-                        # Sentinel-2の適切なRGB表示を作成
-                        sentinel2_rgb = create_sentinel2_rgb_display(processed_tensor)
-                        if sentinel2_rgb is not None:
-                            # Sentinel-2の適切な表示を使用
-                            display_image = enhance_satellite_image_display(sentinel2_rgb)
-                            st.info("✅ Sentinel-2 RGB表示を使用（Red, Green, Blue バンド）")
-                        else:
-                            # フォールバック: 元の画像を使用
-                            display_image = rgb_image
-                            st.info("ℹ️ 元画像を使用")
-                        
                         # 現実的な洪水検出を実行
                         flood_mask, flood_prob = create_realistic_flood_prediction(
-                            display_image, processed_tensor, st.session_state.model
+                            display_rgb_image, processed_tensor, st.session_state.model
                         )
                         
                         # 予測マスク画像を作成（白黒）
-                        prediction_image = np.zeros_like(display_image)
+                        prediction_image = np.zeros_like(display_rgb_image)
                         prediction_image[flood_mask] = [255, 255, 255]  # 洪水=白
                         # 非洪水エリアは黒のまま（0, 0, 0）
                         
                         # オーバーレイ画像を作成
-                        overlay_image = create_prediction_overlay(display_image, flood_mask)
+                        overlay_image = create_prediction_overlay(display_rgb_image, flood_mask)
                         
                         # 統計計算
                         total_pixels = flood_mask.size
@@ -971,7 +966,7 @@ def main():
                         
                         with col1:
                             st.markdown("**Input Image**")
-                            st.image(display_image, use_column_width=True)
+                            st.image(display_rgb_image, use_column_width=True)
                             
                         with col2:
                             st.markdown("**Prediction**")
@@ -1008,7 +1003,7 @@ def main():
                         with col1:
                             # 入力画像ダウンロード（Sentinel-2 RGB）
                             img_buffer = io.BytesIO()
-                            Image.fromarray(display_image).save(img_buffer, format='PNG')
+                            Image.fromarray(display_rgb_image).save(img_buffer, format='PNG')
                             st.download_button(
                                 label="入力画像をダウンロード",
                                 data=img_buffer.getvalue(),
