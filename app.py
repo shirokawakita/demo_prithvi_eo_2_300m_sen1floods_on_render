@@ -1,449 +1,555 @@
 import streamlit as st
+import torch
+import torch.nn as nn
 import numpy as np
 from PIL import Image
 import io
+import base64
 import os
+import yaml
+import rasterio
+from huggingface_hub import hf_hub_download
+from pathlib import Path
+from skimage.transform import resize
+import cv2
 import gc
-
-# 条件付きインポート
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    st.warning("PyTorchが見つかりません。デモモードで動作します。")
-
-try:
-    from huggingface_hub import hf_hub_download
-    HF_AVAILABLE = True
-except ImportError:
-    HF_AVAILABLE = False
-
-try:
-    import rasterio
-    from rasterio.plot import show
-    import matplotlib.pyplot as plt
-    RASTERIO_AVAILABLE = True
-except ImportError:
-    RASTERIO_AVAILABLE = False
+import asyncio
+import threading
 
 # Streamlit設定
 st.set_page_config(
-    page_title="Prithvi-EO-2.0 洪水検出システム (AI統合版)",
+    page_title="Prithvi-EO-2.0 洪水検出",
     page_icon="🌊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 設定
-MODEL_NAME = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11"
-MODEL_FILE = "Prithvi-EO-V2-300M-TL-Sen1Floods11.pt"
-CACHE_DIR = "/tmp/prithvi_cache"
+# イベントループ問題を修正
+def fix_event_loop():
+    """イベントループの問題を修正"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 新しいイベントループを作成
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        # イベントループが存在しない場合は新しく作成
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-@st.cache_resource
-def load_model():
-    """Hugging Face Hubからモデルをダウンロード・ロード"""
+# 初期化時にイベントループを修正
+fix_event_loop()
+
+# 環境変数設定
+def configure_streamlit():
+    """Streamlitの設定を環境変数で行う"""
+    os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
+    os.environ['STREAMLIT_SERVER_PORT'] = str(os.environ.get('PORT', 8501))
+    os.environ['STREAMLIT_SERVER_ADDRESS'] = '0.0.0.0'
+    os.environ['STREAMLIT_SERVER_ENABLE_CORS'] = 'false'
+    os.environ['STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION'] = 'false'
+    os.environ['STREAMLIT_SERVER_MAX_UPLOAD_SIZE'] = '100'
+    os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
+
+configure_streamlit()
+
+class SimpleCNNModel(nn.Module):
+    """簡単なCNNモデル（プレースホルダー用）"""
+    def __init__(self, in_channels=6, num_classes=2):
+        super(SimpleCNNModel, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(128, num_classes, kernel_size=1)
+        self.relu = nn.ReLU()
+        self.upsample = nn.Upsample(size=(512, 512), mode='bilinear', align_corners=False)
     
-    # 依存関係チェック
-    if not TORCH_AVAILABLE or not HF_AVAILABLE:
-        st.info("💡 必要な依存関係が不足しています。デモモードで動作します。")
-        return None, None
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.conv3(x)
+        x = self.upsample(x)
+        return x
+
+class PrithviModelLoader:
+    def __init__(self):
+        self.repo_id = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11"
+        self.model_filename = "Prithvi-EO-V2-300M-TL-Sen1Floods11.pt"
+        self.config_filename = "config.yaml"
+        self.cache_dir = Path("/tmp/prithvi_cache")
+        self.cache_dir.mkdir(exist_ok=True)
     
-    try:
-        # クラウド環境での制約チェック
-        if os.environ.get("RENDER") or os.environ.get("STREAMLIT_CLOUD"):
-            st.info("💡 クラウド環境検出: メモリ制約によりデモモードで動作します")
-            return None, None
-            
-        with st.spinner("Prithvi-EO-2.0モデルをロード中..."):
-            
-            # モデルファイルをダウンロード
-            model_path = hf_hub_download(
-                repo_id=MODEL_NAME,
-                filename=MODEL_FILE,
-                cache_dir=CACHE_DIR
-            )
-            
-            # PyTorchモデルをロード
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            # チェックポイント構造をデバッグ
-            st.info(f"モデルファイルの構造: {type(checkpoint)}")
-            if isinstance(checkpoint, dict):
-                st.info(f"利用可能なキー: {list(checkpoint.keys())}")
-            
-            # チェックポイントから適切にモデルを抽出
-            if isinstance(checkpoint, dict):
-                if 'model' in checkpoint:
-                    model = checkpoint['model']
-                elif 'state_dict' in checkpoint:
-                    st.warning("state_dict形式のモデルは現在サポートされていません")
-                    return None, None
-                else:
-                    st.warning("未知のモデル形式です。利用可能な形式を確認してください。")
-                    return None, None
-            else:
-                model = checkpoint
-            
-            # モデルを評価モードに設定
-            if hasattr(model, 'eval'):
-                model.eval()
-                st.success("✅ Prithvi-EO-2.0モデルをロードしました")
-                return model, device
-            else:
-                st.warning("モデルオブジェクトが正しくありません")
-                return None, None
-            
-    except Exception as e:
-        st.info(f"モデルロードをスキップしました: {str(e)}")
-        st.info("💡 デモモードで動作します")
-        return None, None
-
-def preprocess_image(image_array, target_size=(512, 512)):
-    """画像前処理"""
-    try:
-        if not TORCH_AVAILABLE:
-            return None
-            
-        # RGBチャンネルを6バンドに変換（Prithvi-EO-2.0用）
-        if len(image_array.shape) == 3 and image_array.shape[2] == 3:
-            # RGB画像を6バンドに拡張（デモ用）
-            blue = image_array[:, :, 2]   # B
-            green = image_array[:, :, 1]  # G
-            red = image_array[:, :, 0]    # R
-            nir = np.mean(image_array, axis=2)  # NIR近似
-            swir1 = np.mean(image_array, axis=2) * 0.8  # SWIR1近似
-            swir2 = np.mean(image_array, axis=2) * 0.6  # SWIR2近似
-            
-            # 6バンド画像作成
-            bands = np.stack([blue, green, red, nir, swir1, swir2], axis=2)
-        else:
-            bands = image_array
-        
-        # テンソルに変換
-        tensor = torch.FloatTensor(bands).permute(2, 0, 1).unsqueeze(0)
-        
-        # 正規化
-        tensor = tensor / 255.0
-        
-        return tensor
-        
-    except Exception as e:
-        st.error(f"前処理エラー: {str(e)}")
-        return None
-
-def predict_flood(model, device, input_tensor):
-    """洪水予測実行"""
-    try:
-        if not TORCH_AVAILABLE or model is None or device is None:
-            return None
-            
-        with torch.no_grad():
-            input_tensor = input_tensor.to(device)
-            
-            # 推論実行
-            outputs = model(input_tensor)
-            
-            # 出力処理
-            if hasattr(outputs, 'logits'):
-                prediction = outputs.logits
-            else:
-                prediction = outputs
+    @st.cache_resource
+    def download_and_load_model(_self):
+        """モデルをダウンロードして読み込み"""
+        try:
+            with st.spinner("Prithviモデルをダウンロード中... (約1.28GB)"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
                 
-            # ソフトマックス適用
-            prediction = torch.softmax(prediction, dim=1)
-            
-            # 最大クラスを取得
-            pred_mask = torch.argmax(prediction, dim=1).squeeze().cpu().numpy()
-            
-            return pred_mask
-            
-    except Exception as e:
-        st.error(f"予測エラー: {str(e)}")
-        return None
+                status_text.text("🔄 モデルファイルをダウンロード中...")
+                progress_bar.progress(25)
+                
+                # モデルファイルをダウンロード
+                try:
+                    model_path = hf_hub_download(
+                        repo_id=_self.repo_id,
+                        filename=_self.model_filename,
+                        cache_dir=str(_self.cache_dir)
+                    )
+                    progress_bar.progress(50)
+                except Exception as download_error:
+                    st.warning(f"⚠️ モデルダウンロードエラー: {download_error}")
+                    st.info("💡 プレースホルダーモデルを使用します")
+                    return _self._create_placeholder_model(), {}
+                
+                status_text.text("🔄 設定ファイルをダウンロード中...")
+                progress_bar.progress(75)
+                
+                # 設定ファイルをダウンロード
+                try:
+                    config_path = hf_hub_download(
+                        repo_id=_self.repo_id,
+                        filename=_self.config_filename,
+                        cache_dir=str(_self.cache_dir)
+                    )
+                    
+                    with open(config_path, 'r') as f:
+                        config = yaml.safe_load(f)
+                except Exception as config_error:
+                    st.warning(f"⚠️ 設定ファイルエラー: {config_error}")
+                    config = {}
+                
+                progress_bar.progress(90)
+                status_text.text("🔄 モデルを読み込み中...")
+                
+                # モデル読み込み
+                try:
+                    device = torch.device('cpu')
+                    
+                    # Torchモデルを読み込み
+                    model_data = torch.load(model_path, map_location=device)
+                    
+                    st.write(f"📋 モデルデータ型: {type(model_data)}")
+                    
+                    if isinstance(model_data, dict):
+                        st.write(f"📋 利用可能なキー: {list(model_data.keys())}")
+                        
+                        # 一般的なキーパターンを試行
+                        model = None
+                        for key in ['model', 'state_dict', 'model_state_dict', 'net', 'network']:
+                            if key in model_data:
+                                st.write(f"🔑 キー '{key}' を使用")
+                                try:
+                                    if key == 'state_dict' or key == 'model_state_dict':
+                                        # state_dictの場合は新しいモデルを作成
+                                        model = SimpleCNNModel()
+                                        # 部分的にstate_dictを読み込み（サイズが合わない部分は無視）
+                                        model.load_state_dict(model_data[key], strict=False)
+                                    else:
+                                        model = model_data[key]
+                                    break
+                                except Exception as load_error:
+                                    st.warning(f"⚠️ キー '{key}' でのロードに失敗: {load_error}")
+                                    continue
+                        
+                        # どのキーでも読み込めない場合
+                        if model is None:
+                            st.warning("⚠️ 標準的なキーでモデルを読み込めませんでした")
+                            model = _self._create_placeholder_model()
+                    
+                    else:
+                        # 直接モデルオブジェクトの場合
+                        model = model_data
+                    
+                    # モデルを評価モードに設定
+                    if hasattr(model, 'eval'):
+                        model.eval()
+                    
+                    progress_bar.progress(100)
+                    status_text.text("✅ 完了!")
+                    
+                    # メモリクリーンアップ
+                    gc.collect()
+                    
+                    return model, config
+                    
+                except Exception as model_error:
+                    st.error(f"❌ モデル読み込みエラー: {model_error}")
+                    st.info("💡 プレースホルダーモデルを使用します")
+                    return _self._create_placeholder_model(), {}
+                    
+        except Exception as e:
+            st.error(f"❌ 全体的なエラー: {e}")
+            return _self._create_placeholder_model(), {}
+    
+    def _create_placeholder_model(self):
+        """プレースホルダーモデルを作成"""
+        st.info("🔧 プレースホルダーモデルを作成中...")
+        model = SimpleCNNModel(in_channels=6, num_classes=2)
+        model.eval()
+        return model
 
-def create_demo_mask(image_array):
-    """デモ用マスク（モデルが利用できない場合）"""
-    try:
-        height, width = image_array.shape[:2]
-        
-        # グレースケール変換
-        if len(image_array.shape) == 3:
-            gray = np.mean(image_array, axis=2)
-        else:
-            gray = image_array
+class ImageProcessor:
+    def __init__(self):
+        self.target_size = (512, 512)
+    
+    def process_sentinel2_image(self, uploaded_file):
+        """Sentinel-2画像を処理"""
+        try:
+            # アップロードされたファイルを一時保存
+            temp_path = f"/tmp/{uploaded_file.name}"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
             
-        # 暗い領域を洪水として判定
-        threshold = np.percentile(gray, 30)
-        mask = (gray < threshold).astype(np.uint8)
+            # Rasterioで画像読み込み
+            with rasterio.open(temp_path) as src:
+                # 全バンドを読み込み
+                image_data = src.read()
+                
+                # バンド数確認
+                st.write(f"📊 元画像: {image_data.shape} (バンド, 高さ, 幅)")
+                
+                if image_data.shape[0] < 6:
+                    # バンドが足りない場合は繰り返しで補完
+                    st.warning(f"⚠️ バンド数不足 ({image_data.shape[0]} < 6). 補完します.")
+                    while image_data.shape[0] < 6:
+                        image_data = np.concatenate([image_data, image_data[:1]], axis=0)
+                
+                # 必要な6バンドを選択
+                selected_bands = image_data[:6]
+                
+                # データ型確認・変換
+                st.write(f"📊 データ型: {selected_bands.dtype}")
+                if selected_bands.dtype == np.uint16:
+                    selected_bands = selected_bands.astype(np.float32)
+                elif selected_bands.dtype == np.int16:
+                    selected_bands = selected_bands.astype(np.float32)
+                
+                # サイズ調整
+                st.write(f"📊 リサイズ前: {selected_bands.shape}")
+                processed_bands = []
+                for i, band in enumerate(selected_bands):
+                    resized_band = resize(band, self.target_size, preserve_range=True, anti_aliasing=True)
+                    processed_bands.append(resized_band)
+                
+                processed_image = np.stack(processed_bands, axis=0)
+                st.write(f"📊 リサイズ後: {processed_image.shape}")
+                
+                # 正規化
+                processed_image = self.normalize_image(processed_image)
+                
+                # 一時ファイル削除
+                os.remove(temp_path)
+                
+                return processed_image
+                
+        except Exception as e:
+            # エラー時も一時ファイルを削除
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise Exception(f"画像処理エラー: {e}")
+    
+    def normalize_image(self, image):
+        """画像を正規化"""
+        # 基本的な正規化 (0-1範囲)
+        image_min = np.min(image)
+        image_max = np.max(image)
         
-        return mask
+        if image_max > image_min:
+            image = (image - image_min) / (image_max - image_min)
+        else:
+            image = np.zeros_like(image)
         
-    except Exception as e:
-        st.error(f"デモマスク生成エラー: {str(e)}")
-        return np.zeros((image_array.shape[0], image_array.shape[1]), dtype=np.uint8)
+        return image.astype(np.float32)
+    
+    def create_rgb_image(self, image_data):
+        """RGB画像を作成（可視化用）"""
+        try:
+            # バンド3(Red), 2(Green), 1(Blue)を使用
+            rgb = np.stack([
+                image_data[2] if image_data.shape[0] > 2 else image_data[0],  # Red
+                image_data[1] if image_data.shape[0] > 1 else image_data[0],  # Green  
+                image_data[0]   # Blue
+            ], axis=-1)
+            
+            # 0-255に正規化
+            rgb = (rgb * 255).astype(np.uint8)
+            
+            return rgb
+        except Exception as e:
+            st.error(f"RGB画像作成エラー: {e}")
+            # エラー時はグレースケール画像を返す
+            gray = (image_data[0] * 255).astype(np.uint8)
+            return np.stack([gray, gray, gray], axis=-1)
+    
+    def create_prediction_overlay(self, rgb_image, prediction_mask):
+        """予測マスクをRGB画像にオーバーレイ"""
+        try:
+            overlay = rgb_image.copy()
+            
+            # 洪水領域を赤色でオーバーレイ
+            flood_mask = prediction_mask == 1
+            overlay[flood_mask] = [255, 0, 0]  # 赤色
+            
+            # 透明度を適用
+            alpha = 0.6
+            result = cv2.addWeighted(rgb_image, 1-alpha, overlay, alpha, 0)
+            
+            return result
+        except Exception as e:
+            st.error(f"オーバーレイ作成エラー: {e}")
+            return rgb_image
 
-def visualize_results(original, mask, title_prefix=""):
-    """結果可視化"""
+def create_download_link(image, filename):
+    """画像のダウンロードリンクを作成"""
     try:
-        # オーバーレイ作成
-        overlay = original.copy()
-        if len(overlay.shape) == 3:
-            overlay[mask == 1] = [255, 0, 0]  # 赤色
-        else:
-            overlay[mask == 1] = 255
-            
-        # ブレンド
-        alpha = 0.6
-        if len(original.shape) == 3:
-            result = (alpha * overlay + (1 - alpha) * original).astype(np.uint8)
-        else:
-            result = overlay
-            
-        return result
+        pil_image = Image.fromarray(image)
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format='PNG')
+        buffer.seek(0)
         
+        b64 = base64.b64encode(buffer.read()).decode()
+        href = f'<a href="data:image/png;base64,{b64}" download="{filename}" style="text-decoration: none; color: #1f77b4;">📥 {filename}</a>'
+        return href
     except Exception as e:
-        st.error(f"可視化エラー: {str(e)}")
-        return original
+        return f"ダウンロードエラー: {e}"
+
+def show_system_info():
+    """システム情報を表示"""
+    if st.sidebar.checkbox("システム情報", value=False):
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            st.sidebar.write(f"メモリ使用量: {memory.percent:.1f}%")
+            st.sidebar.write(f"利用可能メモリ: {memory.available / 1024**3:.2f}GB")
+        except:
+            st.sidebar.write("システム情報を取得できません")
 
 def main():
-    """メインアプリケーション"""
+    st.title("🌊 Prithvi-EO-2.0 洪水検出システム")
+    st.markdown("""
+    **IBM & NASAが開発したPrithvi-EO-2.0モデルを使用したSentinel-2画像からの洪水検出**
     
-    # ヘッダー
-    st.title("🌊 Prithvi-EO-2.0 洪水検出システム (AI統合版)")
-    
-    # モデルロード
-    model, device = load_model()
-    
-    # 情報表示
-    with st.expander("ℹ️ アプリケーション情報", expanded=False):
-        if model is not None:
-            st.success("🤖 **実際のPrithvi-EO-2.0モデル使用中**")
-            st.markdown("""
-            - **モデル**: ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11
-            - **データセット**: Sen1Floods11でファインチューニング済み
-            - **入力**: 6バンド（Blue, Green, Red, Narrow NIR, SWIR1, SWIR2）
-            - **出力**: 洪水/非洪水のセマンティックセグメンテーション
-            """)
-        else:
-            st.warning("⚠️ **デモモード**: モデルロードに失敗、パターンベース検出使用中")
-            st.markdown("""
-            - **機能**: 基本的な画像処理とデモ予測
-            - **制限**: 実際のPrithviモデル未使用
-            - **推奨**: 依存関係を確認してください
-            """)
+    このアプリケーションは[Render](https://render.com)上で動作しています。
+    """)
     
     # サイドバー
-    with st.sidebar:
-        st.header("⚙️ 設定")
+    st.sidebar.header("🔧 設定")
+    st.sidebar.markdown("### モデル情報")
+    st.sidebar.info("""
+    - **モデル**: Prithvi-EO-2.0-300M
+    - **サイズ**: 1.28GB
+    - **タスク**: 洪水セマンティックセグメンテーション
+    - **入力**: Sentinel-2 (6バンド)
+    - **解像度**: 512×512ピクセル
+    """)
+    
+    # システム情報表示
+    show_system_info()
+    
+    # モデル初期化
+    if 'model_loaded' not in st.session_state:
+        st.session_state.model_loaded = False
+    
+    if not st.session_state.model_loaded:
+        st.info("🚀 モデルを初期化しています...")
         
-        if model is not None:
-            st.success("🤖 AIモデル: アクティブ")
-            st.info(f"デバイス: {'GPU' if device.type == 'cuda' else 'CPU'}")
-        else:
-            st.warning("🔧 デモモード")
+        try:
+            model_loader = PrithviModelLoader()
+            model, config = model_loader.download_and_load_model()
             
-        st.subheader("📋 対応形式")
-        st.text("• JPG/JPEG")
-        st.text("• PNG")
-        st.text("• TIFF/TIF")
-        
-        st.subheader("📊 システム要件")
-        st.text("• メモリ: 2GB+ 推奨")
-        st.text("• PyTorch")
-        st.text("• Hugging Face Hub")
+            if model is not None:
+                st.session_state.model = model
+                st.session_state.config = config
+                st.session_state.model_loaded = True
+                
+                # プレースホルダーモデルかどうかを確認
+                if isinstance(model, SimpleCNNModel):
+                    st.warning("⚠️ プレースホルダーモードで動作しています。デモ用の予測を表示します。")
+                else:
+                    st.success("✅ Prithviモデルの読み込み完了!")
+                    st.balloons()
+            else:
+                st.error("❌ モデルの初期化に失敗しました")
+                st.stop()
+                
+        except Exception as e:
+            st.error(f"❌ モデル初期化エラー: {e}")
+            st.stop()
+    
+    # 画像処理器初期化
+    processor = ImageProcessor()
     
     # ファイルアップロード
-    st.header("📁 画像アップロード")
+    st.header("📁 Sentinel-2画像のアップロード")
     
     uploaded_file = st.file_uploader(
-        "衛星画像またはテスト画像を選択してください",
-        type=['jpg', 'jpeg', 'png', 'tif', 'tiff'],
-        help="最大100MB、Sentinel-2形式推奨"
+        "TIFFファイルを選択してください",
+        type=['tif', 'tiff'],
+        help="Sentinel-2 L1Cまたは多バンドGeoTIFFファイル（最大100MB）"
     )
     
+    # サンプルデータ情報
+    st.markdown("### 🌍 テスト用データ")
+    st.info("""
+    以下の地域のSentinel-2洪水画像をテストできます：
+    - 🇮🇳 **インド**: モンスーンによる洪水
+    - 🇪🇸 **スペイン**: 河川氾濫
+    - 🇺🇸 **アメリカ**: ハリケーンによる洪水
+    
+    元のリポジトリからサンプルファイルをダウンロードしてお試しください。
+    """)
+    
+    # 画像処理と予測
     if uploaded_file is not None:
         try:
-            # 画像読み込み
-            with st.spinner("画像を処理中..."):
-                # ファイル読み込み
-                file_bytes = uploaded_file.read()
-                
-                # PIL Imageとして開く
-                image = Image.open(io.BytesIO(file_bytes))
-                
-                # RGB変換
-                if image.mode != 'RGB':
-                    if image.mode == 'RGBA':
-                        background = Image.new('RGB', image.size, (255, 255, 255))
-                        background.paste(image, mask=image.split()[-1])
-                        image = background
-                    else:
-                        image = image.convert('RGB')
-                
-                # リサイズ
-                image = image.resize((512, 512), Image.Resampling.LANCZOS)
-                image_array = np.array(image)
+            # ファイル情報表示
+            st.success(f"✅ ファイル受信: {uploaded_file.name} ({uploaded_file.size / 1024 / 1024:.1f} MB)")
             
-            st.success("✅ 画像を正常に読み込みました")
+            # 画像処理
+            with st.spinner("📊 画像を処理中..."):
+                processed_image = processor.process_sentinel2_image(uploaded_file)
+                
+                # RGB可視化画像作成
+                rgb_image = processor.create_rgb_image(processed_image)
             
-            # 画像情報
-            col1, col2, col3 = st.columns(3)
+            st.success("✅ 画像処理完了!")
+            
+            # 入力画像プレビュー
+            st.subheader("🖼️ 入力画像プレビュー")
+            col1, col2 = st.columns([2, 1])
+            
             with col1:
-                st.metric("ファイルサイズ", f"{uploaded_file.size / 1024:.1f} KB")
+                st.image(rgb_image, caption="RGB合成画像 (バンド3,2,1)", use_column_width=True)
+            
             with col2:
-                st.metric("画像サイズ", f"{image_array.shape[1]}×{image_array.shape[0]}")
-            with col3:
-                st.metric("チャンネル数", f"{image_array.shape[2] if len(image_array.shape) > 2 else 1}")
+                st.markdown("**画像情報**")
+                st.write(f"- サイズ: {processed_image.shape[1]}×{processed_image.shape[2]}")
+                st.write(f"- バンド数: {processed_image.shape[0]}")
+                st.write(f"- データ型: {processed_image.dtype}")
+                st.write(f"- 値域: {processed_image.min():.3f} - {processed_image.max():.3f}")
             
-            # 入力画像表示
-            st.subheader("📷 入力画像")
-            st.image(image, caption="処理済み画像（512×512）", use_container_width=True)
+            # 予測実行
+            st.header("🧠 AI洪水検出")
             
-            # 洪水検出実行
-            if st.button("🔍 洪水検出を実行", type="primary"):
-                with st.spinner("AI推論を実行中..."):
-                    
-                    if model is not None:
-                        # 実際のPrithviモデルで予測
-                        st.info("🤖 Prithvi-EO-2.0モデルで推論中...")
+            if st.button("🔍 洪水検出を実行", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("🤖 Prithviモデルで予測中..."):
+                        # 進行状況表示
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
                         
-                        # 前処理
-                        input_tensor = preprocess_image(image_array)
+                        status_text.text("📊 テンソルに変換中...")
+                        progress_bar.progress(25)
                         
-                        if input_tensor is not None:
-                            # 予測実行
-                            pred_mask = predict_flood(model, device, input_tensor)
-                            
-                            if pred_mask is not None:
-                                # 二値化（クラス1を洪水とする）
-                                flood_mask = (pred_mask == 1).astype(np.uint8)
-                                prediction_type = "🤖 AI予測"
-                            else:
-                                # フォールバック
-                                flood_mask = create_demo_mask(image_array)
-                                prediction_type = "⚠️ デモ予測（AI予測失敗）"
-                        else:
-                            # フォールバック
-                            flood_mask = create_demo_mask(image_array)
-                            prediction_type = "⚠️ デモ予測（前処理失敗）"
-                    else:
-                        # デモモード
-                        st.info("🔧 デモモードで処理中...")
-                        flood_mask = create_demo_mask(image_array)
-                        prediction_type = "🔧 デモ予測"
+                        # テンソルに変換
+                        input_tensor = torch.from_numpy(processed_image).unsqueeze(0).float()
+                        st.write(f"📊 入力テンソル形状: {input_tensor.shape}")
+                        
+                        status_text.text("🧠 AI予測実行中...")
+                        progress_bar.progress(50)
+                        
+                        # 予測実行
+                        with torch.no_grad():
+                            prediction = st.session_state.model(input_tensor)
+                            st.write(f"📊 予測出力形状: {prediction.shape}")
+                            prediction_mask = torch.argmax(prediction, dim=1).squeeze().numpy()
+                        
+                        status_text.text("🎨 結果画像を生成中...")
+                        progress_bar.progress(75)
+                        
+                        # オーバーレイ画像作成
+                        overlay_image = processor.create_prediction_overlay(rgb_image, prediction_mask)
+                        
+                        progress_bar.progress(100)
+                        status_text.text("✅ 完了!")
+                        
+                        # メモリクリーンアップ
+                        del prediction, input_tensor
+                        gc.collect()
                     
-                    # 結果可視化
-                    overlay_result = visualize_results(image_array, flood_mask)
-                    
-                    # 統計計算
-                    total_pixels = flood_mask.size
-                    flood_pixels = np.sum(flood_mask == 1)
-                    flood_percentage = (flood_pixels / total_pixels) * 100
+                    # プレースホルダーモデル使用時の警告
+                    if isinstance(st.session_state.model, SimpleCNNModel):
+                        st.warning("⚠️ プレースホルダーモデルによるデモ予測結果です。")
                     
                     # 結果表示
-                    st.subheader(f"📊 洪水検出結果 ({prediction_type})")
+                    st.header("📊 検出結果")
                     
                     # 統計情報
+                    total_pixels = prediction_mask.size
+                    flood_pixels = np.sum(prediction_mask == 1)
+                    flood_ratio = flood_pixels / total_pixels * 100
+                    
                     col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("総ピクセル数", f"{total_pixels:,}")
-                    with col2:
-                        st.metric("洪水ピクセル数", f"{flood_pixels:,}")
-                    with col3:
-                        st.metric("洪水面積率", f"{flood_percentage:.2f}%")
+                    col1.metric("総ピクセル数", f"{total_pixels:,}")
+                    col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
+                    col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
                     
                     # 結果画像表示
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        st.subheader("🖼️ 入力画像")
-                        st.image(image, caption="元画像", use_container_width=True)
+                        st.subheader("入力画像 (RGB)")
+                        st.image(rgb_image, use_column_width=True)
                     
                     with col2:
-                        st.subheader("🗺️ 予測マスク")
-                        mask_image = Image.fromarray((flood_mask * 255).astype(np.uint8))
-                        st.image(mask_image, caption="洪水領域（白：洪水、黒：非洪水）", use_container_width=True)
+                        st.subheader("洪水予測マスク")
+                        mask_vis = (prediction_mask * 255).astype(np.uint8)
+                        st.image(mask_vis, use_column_width=True)
                     
                     with col3:
-                        st.subheader("🎯 オーバーレイ")
-                        st.image(overlay_result, caption="洪水領域オーバーレイ（赤：洪水）", use_container_width=True)
+                        st.subheader("オーバーレイ結果")
+                        st.image(overlay_image, use_column_width=True)
                     
                     # ダウンロードセクション
-                    st.subheader("💾 結果のダウンロード")
+                    st.subheader("💾 結果ダウンロード")
                     
                     col1, col2, col3 = st.columns(3)
                     
-                    # ダウンロード用バイトデータ作成
-                    def img_to_bytes(img_array):
-                        img = Image.fromarray(img_array)
-                        buf = io.BytesIO()
-                        img.save(buf, format='PNG')
-                        buf.seek(0)
-                        return buf.getvalue()
-                    
                     with col1:
-                        input_bytes = img_to_bytes(image_array)
-                        st.download_button(
-                            "📷 入力画像をダウンロード",
-                            data=input_bytes,
-                            file_name=f"input_{uploaded_file.name.split('.')[0]}.png",
-                            mime="image/png"
-                        )
+                        st.markdown(create_download_link(rgb_image, "input_rgb.png"), unsafe_allow_html=True)
                     
                     with col2:
-                        mask_bytes = img_to_bytes((flood_mask * 255).astype(np.uint8))
-                        st.download_button(
-                            "🗺️ 予測マスクをダウンロード",
-                            data=mask_bytes,
-                            file_name=f"mask_{uploaded_file.name.split('.')[0]}.png",
-                            mime="image/png"
-                        )
+                        st.markdown(create_download_link(np.stack([mask_vis]*3, axis=-1), "prediction_mask.png"), unsafe_allow_html=True)
                     
                     with col3:
-                        overlay_bytes = img_to_bytes(overlay_result)
-                        st.download_button(
-                            "🎯 オーバーレイをダウンロード",
-                            data=overlay_bytes,
-                            file_name=f"overlay_{uploaded_file.name.split('.')[0]}.png",
-                            mime="image/png"
-                        )
+                        st.markdown(create_download_link(overlay_image, "flood_overlay.png"), unsafe_allow_html=True)
                     
-                    # 注意事項
-                    if model is not None:
-                        st.success("""
-                        ✅ **実際のPrithvi-EO-2.0モデルを使用**: 
-                        Sen1Floods11データセットでファインチューニングされた高精度なAIモデルによる洪水検出結果です。
-                        """)
-                    else:
-                        st.info("""
-                        ℹ️ **デモモード**: 
-                        実際のPrithvi-EO-2.0モデルは利用できませんが、基本的な画像処理による洪水領域の推定を表示しています。
-                        """)
+                    # 解釈ガイド
+                    st.subheader("📖 結果の解釈")
+                    st.markdown("""
+                    - **白い領域**: 洪水と予測された水域
+                    - **黒い領域**: 非洪水域（陸地）
+                    - **赤い領域**: オーバーレイ画像の洪水領域
                     
-                    # メモリクリーンアップ
-                    del flood_mask, overlay_result
-                    gc.collect()
-        
+                    **注意**: プレースホルダーモードでは実際の洪水検出ではなく、デモ用の予測結果を表示しています。
+                    """)
+                    
+                except Exception as predict_error:
+                    st.error(f"❌ 予測エラー: {predict_error}")
+                    st.write("デバッグ情報:")
+                    st.write(f"- モデル型: {type(st.session_state.model)}")
+                    st.write(f"- 入力画像形状: {processed_image.shape}")
+                    
         except Exception as e:
-            st.error(f"画像処理中にエラーが発生しました: {str(e)}")
-            
-            # デバッグ情報
-            with st.expander("🔧 デバッグ情報"):
-                st.code(f"""
-                ファイル名: {uploaded_file.name}
-                ファイルサイズ: {uploaded_file.size} bytes
-                エラー詳細: {str(e)}
-                """)
+            st.error(f"❌ エラー: {e}")
+            st.markdown("### 🔧 トラブルシューティング")
+            st.markdown("""
+            - ファイルが正しいTIFF形式か確認してください
+            - ファイルサイズが100MB以下か確認してください
+            - 多バンド画像（最低1バンド以上）を使用してください
+            """)
     
     # フッター
     st.markdown("---")
     st.markdown("""
-    **開発者:** IBM & NASA Geospatial Team  
-    **モデル:** [Prithvi-EO-2.0-300M-TL-Sen1Floods11](https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11)  
-    **Paper:** [Prithvi-EO-2.0: A Versatile Multi-Temporal Foundation Model](https://arxiv.org/abs/2412.02732)
-    """)
+    <div style='text-align: center; color: #666;'>
+        <p>🌊 Prithvi-EO-2.0 洪水検出システム | Powered by IBM & NASA | Running on Render</p>
+        <p>モデル: <a href='https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11'>Hugging Face</a> | 
+        ソースコード: <a href='https://github.com/shirokawakita/demo_prithvi_eo_2_300m_sen1floods'>GitHub</a></p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
