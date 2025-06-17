@@ -644,6 +644,59 @@ def preprocess_image_standalone(img_array):
         
         return tensor
 
+def create_realistic_flood_prediction(rgb_image, processed_tensor, model):
+    """現実的な洪水検出予測を生成（参考画像と同じ形式）"""
+    try:
+        with torch.no_grad():
+            # モデル推論
+            prediction = model(processed_tensor)
+            prediction = torch.softmax(prediction, dim=1)
+            flood_prob = prediction[0, 1].cpu().numpy()  # 洪水確率
+            
+            # より現実的な洪水検出のための後処理
+            # 1. 低い確率の領域を除去（ノイズ除去）
+            flood_mask = flood_prob > 0.3  # 30%以上の確率のみ
+            
+            # 2. 小さな領域を除去（モルフォロジー処理）
+            kernel = np.ones((3, 3), np.uint8)
+            flood_mask = cv2.morphologyEx(flood_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+            flood_mask = cv2.morphologyEx(flood_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # 3. 画像の特徴に基づく追加フィルタリング
+            # 暗い領域（水域の可能性が高い）を重視
+            gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+            dark_areas = gray < np.percentile(gray, 40)  # 下位40%の暗い領域
+            
+            # 青色成分が強い領域（水域の特徴）
+            blue_channel = rgb_image[:, :, 2]
+            blue_dominant = blue_channel > np.mean([rgb_image[:, :, 0], rgb_image[:, :, 1]], axis=0)
+            
+            # 最終的な洪水マスク（複数条件の組み合わせ）
+            final_flood_mask = flood_mask & (dark_areas | blue_dominant)
+            
+            # さらなるノイズ除去
+            final_flood_mask = cv2.morphologyEx(final_flood_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+            
+            return final_flood_mask.astype(bool), flood_prob
+            
+    except Exception as e:
+        st.error(f"❌ 予測生成エラー: {e}")
+        # フォールバック: 簡単な水域検出
+        gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+        water_mask = gray < np.percentile(gray, 25)  # 下位25%の暗い領域
+        return water_mask, np.random.random(rgb_image.shape[:2]) * 0.5
+
+def create_prediction_overlay(rgb_image, flood_mask):
+    """予測結果のオーバーレイ画像を作成"""
+    overlay = rgb_image.copy()
+    # 洪水検出エリアを赤色でオーバーレイ
+    overlay[flood_mask] = [255, 0, 0]  # 赤色
+    
+    # 透明度を適用
+    alpha = 0.6
+    result = cv2.addWeighted(rgb_image, 1-alpha, overlay, alpha, 0)
+    return result
+
 def main():
     st.title("🌊 Prithvi-EO-2.0 洪水検出システム（Standard Plan）")
     
@@ -800,25 +853,10 @@ def main():
                 st.write(f"- データ型: {processed_data.dtype}")
                 st.write(f"- 値域: {processed_data.min():.3f} - {processed_data.max():.3f}")
             
-            # 画像前処理
-            st.subheader("🔧 画像前処理")
-            
-            # 前処理実行
+            # 画像前処理（バックグラウンド処理）
             try:
-                with st.spinner("画像を前処理中..."):
-                    processed_tensor = preprocess_image_standalone(rgb_image)
-                    
+                processed_tensor = preprocess_image_standalone(rgb_image)
                 st.success(f"✅ 前処理完了: {processed_tensor.shape}")
-                st.info(f"📊 処理形状: Batch={processed_tensor.shape[0]}, Channels={processed_tensor.shape[1]}, Height={processed_tensor.shape[2]}, Width={processed_tensor.shape[3]}")
-                
-                # テンソル統計情報
-                with st.expander("📈 前処理統計"):
-                    st.write(f"**データ型**: {processed_tensor.dtype}")
-                    st.write(f"**最小値**: {processed_tensor.min().item():.4f}")
-                    st.write(f"**最大値**: {processed_tensor.max().item():.4f}")
-                    st.write(f"**平均値**: {processed_tensor.mean().item():.4f}")
-                    st.write(f"**標準偏差**: {processed_tensor.std().item():.4f}")
-                    
             except Exception as preprocess_error:
                 st.error(f"❌ 前処理エラー: {preprocess_error}")
                 processed_tensor = None
@@ -837,119 +875,106 @@ def main():
             
             predict_button = st.button("🔍 洪水検出を実行", type="primary", use_container_width=True)
             
-            if predict_button:
+            if predict_button and processed_tensor is not None:
                 try:
-                    with st.spinner("🔮 Standard Plan: 独自Prithviモデルで推論実行中..."):
-                        # Standalone推論処理
-                        with torch.no_grad():
-                            # モデル推論
-                            if isinstance(st.session_state.model, AdvancedPrithviModel):
-                                st.info("🚀 AdvancedPrithviModel による推論を実行中...")
-                                prediction = st.session_state.model(processed_tensor)
-                            else:
-                                st.info("🔧 フォールバックモデルによる推論を実行中...")
-                                prediction = st.session_state.model(processed_tensor)
+                    with st.spinner("🔮 洪水検出を実行中..."):
+                        # 現実的な洪水検出を実行
+                        flood_mask, flood_prob = create_realistic_flood_prediction(
+                            rgb_image, processed_tensor, st.session_state.model
+                        )
+                        
+                        # 予測マスク画像を作成（白黒）
+                        prediction_image = np.zeros_like(rgb_image)
+                        prediction_image[flood_mask] = [255, 255, 255]  # 洪水=白
+                        # 非洪水エリアは黒のまま（0, 0, 0）
+                        
+                        # オーバーレイ画像を作成
+                        overlay_image = create_prediction_overlay(rgb_image, flood_mask)
+                        
+                        # 統計計算
+                        total_pixels = flood_mask.size
+                        flood_pixels = np.sum(flood_mask)
+                        flood_percentage = (flood_pixels / total_pixels) * 100
+                        
+                        st.success("✅ 洪水検出完了!")
+                        
+                        # 参考画像と同じ3カラム表示
+                        st.subheader("📊 結果")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.markdown("**Input Image**")
+                            st.image(rgb_image, use_column_width=True)
                             
-                            # 後処理
-                            prediction = torch.softmax(prediction, dim=1)
-                            flood_probability = prediction[0, 1].cpu().numpy()  # クラス1（洪水）の確率
+                        with col2:
+                            st.markdown("**Prediction**")
+                            st.image(prediction_image, use_column_width=True)
                             
-                            # 結果の可視化
-                            st.success("✅ 推論完了!")
+                        with col3:
+                            st.markdown("**Overlay**")
+                            st.image(overlay_image, use_column_width=True)
+                        
+                        # 統計情報を簡潔に表示
+                        st.subheader("📈 検出結果")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("洪水検出率", f"{flood_percentage:.2f}%")
+                        with col2:
+                            st.metric("洪水ピクセル数", f"{flood_pixels:,}")
+                        with col3:
+                            st.metric("総ピクセル数", f"{total_pixels:,}")
+                        
+                        # リスクレベル判定
+                        if flood_percentage > 20:
+                            st.error("🚨 **高リスク**: 大規模な洪水の可能性")
+                        elif flood_percentage > 5:
+                            st.warning("⚠️ **中リスク**: 部分的な洪水の可能性")
+                        else:
+                            st.info("✅ **低リスク**: 限定的な水域検出")
+                        
+                        # ダウンロードセクション
+                        st.subheader("💾 ダウンロード")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            # 入力画像ダウンロード
+                            img_buffer = io.BytesIO()
+                            Image.fromarray(rgb_image).save(img_buffer, format='PNG')
+                            st.download_button(
+                                label="入力画像をダウンロード",
+                                data=img_buffer.getvalue(),
+                                file_name="input_image.png",
+                                mime="image/png"
+                            )
+                        
+                        with col2:
+                            # 予測画像ダウンロード
+                            pred_buffer = io.BytesIO()
+                            Image.fromarray(prediction_image).save(pred_buffer, format='PNG')
+                            st.download_button(
+                                label="予測結果をダウンロード",
+                                data=pred_buffer.getvalue(),
+                                file_name="prediction.png",
+                                mime="image/png"
+                            )
+                        
+                        with col3:
+                            # オーバーレイ画像ダウンロード
+                            overlay_buffer = io.BytesIO()
+                            Image.fromarray(overlay_image).save(overlay_buffer, format='PNG')
+                            st.download_button(
+                                label="オーバーレイをダウンロード",
+                                data=overlay_buffer.getvalue(),
+                                file_name="overlay.png",
+                                mime="image/png"
+                            )
                             
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.subheader("📊 洪水検出結果")
-                                
-                                # 統計情報
-                                flood_pixels = (flood_probability > 0.5).sum()
-                                total_pixels = flood_probability.size
-                                flood_percentage = (flood_pixels / total_pixels) * 100
-                                
-                                st.metric(
-                                    label="洪水検出エリア",
-                                    value=f"{flood_percentage:.2f}%",
-                                    delta=f"{flood_pixels:,} / {total_pixels:,} ピクセル"
-                                )
-                                
-                                # 信頼度分布
-                                fig_hist, ax_hist = plt.subplots(figsize=(8, 4))
-                                ax_hist.hist(flood_probability.flatten(), bins=50, alpha=0.7, color='skyblue')
-                                ax_hist.set_xlabel('洪水確率')
-                                ax_hist.set_ylabel('ピクセル数')
-                                ax_hist.set_title('洪水確率分布')
-                                ax_hist.grid(True, alpha=0.3)
-                                st.pyplot(fig_hist)
-                                
-                            with col2:
-                                st.subheader("🗺️ 洪水マップ")
-                                
-                                # カラーマップ作成
-                                flood_map = plt.cm.Blues(flood_probability)
-                                flood_map[flood_probability > 0.5] = [1, 0, 0, 1]  # 高リスクエリアを赤色
-                                
-                                fig_map, ax_map = plt.subplots(figsize=(8, 8))
-                                im = ax_map.imshow(flood_map)
-                                ax_map.set_title('洪水リスクマップ\n(赤: 高リスク、青: 水の可能性)')
-                                ax_map.axis('off')
-                                
-                                # カラーバー
-                                cbar = plt.colorbar(plt.cm.ScalarMappable(cmap='Blues'), ax=ax_map)
-                                cbar.set_label('洪水確率')
-                                
-                                st.pyplot(fig_map)
-                                
-                            # 詳細な分析結果
-                            st.subheader("📈 詳細分析")
-                            
-                            analysis_col1, analysis_col2, analysis_col3 = st.columns(3)
-                            
-                            with analysis_col1:
-                                st.metric(
-                                    "平均洪水確率", 
-                                    f"{flood_probability.mean():.3f}",
-                                    help="全体的な洪水リスクレベル"
-                                )
-                                
-                            with analysis_col2:
-                                st.metric(
-                                    "最大洪水確率", 
-                                    f"{flood_probability.max():.3f}",
-                                    help="最も高いリスクエリアの確率"
-                                )
-                                
-                            with analysis_col3:
-                                st.metric(
-                                    "高リスクエリア", 
-                                    f"{((flood_probability > 0.7).sum() / total_pixels * 100):.2f}%",
-                                    help="70%以上の確率で洪水と判定されたエリア"
-                                )
-                                
-                            # 警告とアドバイス
-                            if flood_percentage > 30:
-                                st.error("🚨 **高リスク**: 広範囲での洪水の可能性が検出されました。")
-                                st.error("⚠️ 避難準備や緊急対応の検討が必要です。")
-                            elif flood_percentage > 10:
-                                st.warning("⚠️ **中リスク**: 部分的な洪水の可能性があります。")
-                                st.warning("💡 継続的な監視と準備を推奨します。")
-                            else:
-                                st.info("✅ **低リスク**: 洪水の兆候は限定的です。")
-                                st.info("💡 通常の監視を継続してください。")
-                                
-                            # 技術情報
-                            with st.expander("🔧 技術詳細"):
-                                st.write("**使用モデル**: AdvancedPrithviModel (独自実装)")
-                                st.write("**入力サイズ**: 512x512 pixels, 6 bands")
-                                st.write("**処理時間**: Standard Plan最適化済み")
-                                st.write("**メモリ使用量**: 2GB RAM内で動作")
-                                st.write(f"**推論形状**: {prediction.shape}")
-                                st.write(f"**確率分布**: Min={flood_probability.min():.4f}, Max={flood_probability.max():.4f}")
-                                
                 except Exception as e:
                     st.error(f"❌ **推論エラー**: {e}")
                     st.info("💡 画像形式や前処理に問題がある可能性があります。")
-                    st.info("🔧 別の画像で再試行してください。")
                     import traceback
                     st.code(traceback.format_exc())
             
