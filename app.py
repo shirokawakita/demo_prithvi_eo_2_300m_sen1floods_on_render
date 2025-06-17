@@ -15,6 +15,21 @@ import cv2
 import gc
 import asyncio
 import threading
+import tempfile
+
+# Import functions from inference.py
+try:
+    from inference import (
+        SemanticSegmentationTask,
+        Sen1Floods11NonGeoDataModule,
+        load_example,
+        run_model,
+        save_prediction
+    )
+    INFERENCE_AVAILABLE = True
+except ImportError:
+    st.error("❌ inference.pyが見つかりません。正しいファイルが配置されていることを確認してください。")
+    INFERENCE_AVAILABLE = False
 
 # Streamlit設定
 st.set_page_config(
@@ -152,7 +167,11 @@ class PrithviModelLoader:
     
     @st.cache_resource
     def download_and_load_model(_self):
-        """モデルをダウンロードして読み込み"""
+        """正しいPrithviモデルをダウンロードして読み込み"""
+        if not INFERENCE_AVAILABLE:
+            st.error("❌ inference.pyが利用できないため、プレースホルダーモデルを使用します")
+            return _self._create_placeholder_model(), {}
+            
         try:
             with st.spinner("Prithviモデルをダウンロード中... (約1.28GB)"):
                 progress_bar = st.progress(0)
@@ -196,129 +215,65 @@ class PrithviModelLoader:
                     config = {}
                 
                 progress_bar.progress(90)
-                status_text.text("🔄 モデルを読み込み中...")
+                status_text.text("🔄 正しいPrithviモデルを作成中...")
                 
-                # モデル読み込み - より詳細なデバッグ
+                # 正しいPrithviモデルを作成（main.pyの実装に基づく）
                 try:
                     device = torch.device('cpu')
                     
-                    st.write("🔍 **モデルファイルの詳細分析開始**")
+                    st.write("🔍 **正しいPrithviモデルを作成中**")
                     
-                    # Prithviモデルを正しく読み込み
-                    model_data = torch.load(model_path, map_location=device)
+                    # SemanticSegmentationTaskでモデルを作成
+                    model = SemanticSegmentationTask(
+                        model_args={
+                            "backbone_pretrained": True,
+                            "backbone": "prithvi_eo_v2_300_tl",
+                            "decoder": "UperNetDecoder",
+                            "decoder_channels": 256,
+                            "decoder_scale_modules": True,
+                            "num_classes": 2,
+                            "rescale": True,
+                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                            "head_dropout": 0.1,
+                            "necks": [
+                                {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
+                                {"name": "ReshapeTokensToImage"},
+                            ],
+                        },
+                        model_factory="EncoderDecoderFactory",
+                        loss="ce",
+                        ignore_index=-1,
+                        lr=0.001,
+                        freeze_backbone=False,
+                        freeze_decoder=False,
+                        plot_on_val=10,
+                    )
                     
-                    st.write(f"📋 モデルデータ型: {type(model_data)}")
-                    st.write(f"📋 データサイズ: {len(str(model_data))} 文字")
+                    st.success("✅ SemanticSegmentationTaskモデル作成成功")
                     
-                    if isinstance(model_data, dict):
-                        st.write(f"📋 利用可能なキー: {list(model_data.keys())}")
-                        
-                        # 各キーの詳細情報を表示
-                        for key in model_data.keys():
-                            value = model_data[key]
-                            st.write(f"  - **{key}**: {type(value)}")
-                            if hasattr(value, 'shape'):
-                                st.write(f"    形状: {value.shape}")
-                            elif isinstance(value, dict):
-                                st.write(f"    辞書キー数: {len(value)}")
-                                if len(value) < 10:  # 小さい辞書の場合はキーを表示
-                                    st.write(f"    サブキー: {list(value.keys())}")
-                        
-                        # Prithviモデルの構造を理解してから読み込み
-                        model = None
-                        
-                        # まず、'model'キーを優先的に試行
-                        if 'model' in model_data:
-                            st.write("🔑 'model' キーを使用")
-                            try:
-                                model_obj = model_data['model']
-                                st.write(f"🔍 modelオブジェクト型: {type(model_obj)}")
-                                
-                                # モデルがnn.Moduleの場合
-                                if isinstance(model_obj, nn.Module):
-                                    model = model_obj
-                                    st.success("✅ 'model' キーからnn.Module読み込み成功")
-                                else:
-                                    st.write(f"⚠️ modelは{type(model_obj)}です。state_dictかもしれません。")
-                                    
-                            except Exception as load_error:
-                                st.warning(f"⚠️ 'model' キーでの読み込み失敗: {load_error}")
-                        
-                        # 次に state_dict系のキーを試行
-                        if model is None:
-                            for key in ['state_dict', 'model_state_dict']:
-                                if key in model_data:
-                                    st.write(f"🔑 キー '{key}' を試行中...")
-                                    try:
-                                        # 実際のPrithviモデルの構造を推測する必要がある
-                                        # とりあえずstate_dictの中身を確認
-                                        state_dict = model_data[key]
-                                        st.write(f"📋 State dict keys sample: {list(state_dict.keys())[:10]}")
-                                        st.write(f"📋 State dict総キー数: {len(state_dict)}")
-                                        
-                                        # state_dictの構造から元のモデル構造を推測
-                                        has_transformer = any('transformer' in k or 'attention' in k for k in state_dict.keys())
-                                        has_encoder = any('encoder' in k for k in state_dict.keys())
-                                        has_decoder = any('decoder' in k for k in state_dict.keys())
-                                        
-                                        st.write(f"🔍 推測される構造:")
-                                        st.write(f"  - Transformer要素: {has_transformer}")
-                                        st.write(f"  - Encoder要素: {has_encoder}")
-                                        st.write(f"  - Decoder要素: {has_decoder}")
-                                        
-                                        # 実際のPrithviモデルを作成してstate_dictを読み込み
-                                        try:
-                                            model = PrithviModel(
-                                                img_size=512,
-                                                patch_size=16,
-                                                num_frames=1,  # 単一時点の画像
-                                                num_bands=6,   # Sentinel-2の6バンド
-                                                embed_dim=768,
-                                                num_classes=2  # 洪水/非洪水
-                                            )
-                                            # state_dictの構造を調整して読み込み
-                                            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-                                            st.success("✅ Prithviモデルのstate_dictを読み込み成功!")
-                                            st.write(f"📋 不足キー数: {len(missing_keys)}")
-                                            st.write(f"📋 予期しないキー数: {len(unexpected_keys)}")
-                                            if missing_keys:
-                                                st.write(f"📋 不足キー例: {missing_keys[:5]}")
-                                            if unexpected_keys:
-                                                st.write(f"📋 予期しないキー例: {unexpected_keys[:5]}")
-                                        except Exception as prithvi_error:
-                                            st.warning(f"⚠️ Prithviモデルの作成に失敗: {prithvi_error}")
-                                            st.info("💡 プレースホルダーモデルを使用します")
-                                            model = _self._create_placeholder_model()
-                                        break
-                                    except Exception as load_error:
-                                        st.warning(f"⚠️ キー '{key}' での読み込み失敗: {load_error}")
-                        
-                        # 他のキーも試行
-                        if model is None:
-                            for key in ['net', 'network', 'encoder', 'decoder']:
-                                if key in model_data:
-                                    st.write(f"🔑 キー '{key}' を試行中...")
-                                    try:
-                                        model = model_data[key]
-                                        st.success(f"✅ キー '{key}' からの読み込み成功")
-                                        break
-                                    except Exception as load_error:
-                                        st.warning(f"⚠️ キー '{key}' での読み込み失敗: {load_error}")
-                        
-                        # どのキーでも読み込めない場合
-                        if model is None:
-                            st.warning("⚠️ 標準的なキーでモデルを読み込めませんでした")
-                            st.info("💡 実際のPrithviモデル構造の実装が必要です")
-                            model = _self._create_placeholder_model()
+                    # チェックポイント読み込み
+                    st.write("🔄 チェックポイントを読み込み中...")
+                    checkpoint_dict = torch.load(model_path, map_location=device)["state_dict"]
                     
-                    else:
-                        # 直接モデルオブジェクトの場合
-                        model = model_data
-                        st.success("✅ 直接モデルオブジェクトを読み込み")
+                    # キー名を調整（main.pyの実装に基づく）
+                    new_state_dict = {}
+                    for k, v in checkpoint_dict.items():
+                        if k.startswith("model.encoder._timm_module."):
+                            new_key = k.replace("model.encoder._timm_module.", "model.encoder.")
+                            new_state_dict[new_key] = v
+                        else:
+                            new_state_dict[k] = v
                     
-                    # モデルを評価モードに設定
-                    if hasattr(model, 'eval'):
-                        model.eval()
+                    # state_dictを読み込み
+                    missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+                    st.success("✅ 正しいPrithviモデルの読み込み完了!")
+                    st.write(f"📋 不足キー数: {len(missing_keys)}")
+                    st.write(f"📋 予期しないキー数: {len(unexpected_keys)}")
+                    
+                    model.eval()
+                    
+                    # データモジュールも作成
+                    datamodule = Sen1Floods11NonGeoDataModule(config)
                     
                     progress_bar.progress(100)
                     status_text.text("✅ 完了!")
@@ -326,16 +281,16 @@ class PrithviModelLoader:
                     # メモリクリーンアップ
                     gc.collect()
                     
-                    return model, config
+                    return model, datamodule, config
                     
                 except Exception as model_error:
-                    st.error(f"❌ モデル読み込みエラー: {model_error}")
+                    st.error(f"❌ 正しいモデル作成エラー: {model_error}")
                     st.info("💡 プレースホルダーモデルを使用します")
-                    return _self._create_placeholder_model(), {}
+                    return _self._create_placeholder_model(), {}, {}
                     
         except Exception as e:
             st.error(f"❌ 全体的なエラー: {e}")
-            return _self._create_placeholder_model(), {}
+            return _self._create_placeholder_model(), {}, {}
     
     def _create_placeholder_model(self):
         """プレースホルダーモデルを作成"""
@@ -347,75 +302,134 @@ class PrithviModelLoader:
 class ImageProcessor:
     def __init__(self):
         self.target_size = (512, 512)
+        self.target_dtype = np.int16
+    
+    def preprocess_image(self, file_path, target_size=(512, 512), target_dtype=np.int16):
+        """
+        main.pyの実装に基づいた前処理:
+        - Resize to target size
+        - Convert data type
+        - Normalize data range
+        """
+        st.info(f"画像を前処理中... (目標サイズ: {target_size}, データ型: {target_dtype})")
+        
+        with rasterio.open(file_path) as src:
+            # Read all bands
+            img = src.read()  # Shape: (bands, height, width)
+            profile = src.profile.copy()
+            
+            st.info(f"元画像: バンド数={img.shape[0]}, サイズ={img.shape[1]}x{img.shape[2]}, データ型={img.dtype}")
+            
+            # Resize each band if necessary
+            if img.shape[1:] != target_size:
+                st.info(f"画像をリサイズ中: {img.shape[1]}x{img.shape[2]} → {target_size[0]}x{target_size[1]}")
+                resized_bands = []
+                for i in range(img.shape[0]):
+                    # Resize each band individually
+                    resized_band = resize(
+                        img[i], 
+                        target_size, 
+                        preserve_range=True,
+                        anti_aliasing=True
+                    ).astype(img.dtype)
+                    resized_bands.append(resized_band)
+                img = np.stack(resized_bands, axis=0)
+            
+            # Convert data type if necessary
+            if img.dtype != target_dtype:
+                st.info(f"データ型を変換中: {img.dtype} → {target_dtype}")
+                
+                # Normalize to target data type range
+                if img.dtype == np.uint16 and target_dtype == np.int16:
+                    # Convert uint16 to int16 range
+                    # uint16: 0-65535 → int16: -32768 to 32767
+                    # But we'll map to positive range similar to training data (1000-3000)
+                    img_min, img_max = img.min(), img.max()
+                    # Normalize to 0-1 range
+                    img_normalized = (img.astype(np.float32) - img_min) / (img_max - img_min)
+                    # Scale to target range (similar to training data: 1000-3000)
+                    img = (img_normalized * 2000 + 1000).astype(target_dtype)
+                else:
+                    # General conversion
+                    img = img.astype(target_dtype)
+            
+            st.success(f"前処理完了: バンド数={img.shape[0]}, サイズ={img.shape[1]}x{img.shape[2]}, データ型={img.dtype}")
+            
+            # Save preprocessed image to temporary file
+            output_path = file_path.replace('.tif', '_preprocessed.tif')
+            
+            # Update profile for the new image
+            profile.update({
+                'height': target_size[0],
+                'width': target_size[1],
+                'dtype': target_dtype,
+                'count': img.shape[0]
+            })
+            
+            with rasterio.open(output_path, 'w', **profile) as dst:
+                dst.write(img)
+            
+            return output_path
     
     def process_sentinel2_image(self, uploaded_file):
-        """Sentinel-2画像を処理"""
+        """Sentinel-2画像を処理（main.pyの実装に基づく）"""
         try:
-            # アップロードされたファイルを一時保存
-            temp_path = f"/tmp/{uploaded_file.name}"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
             
-            # Rasterioで画像読み込み
-            with rasterio.open(temp_path) as src:
-                # 全バンドを読み込み
-                image_data = src.read()
-                
-                # バンド数確認
-                st.write(f"📊 元画像: {image_data.shape} (バンド, 高さ, 幅)")
-                
-                if image_data.shape[0] < 6:
-                    # バンドが足りない場合は繰り返しで補完
-                    st.warning(f"⚠️ バンド数不足 ({image_data.shape[0]} < 6). 補完します.")
-                    while image_data.shape[0] < 6:
-                        image_data = np.concatenate([image_data, image_data[:1]], axis=0)
-                
-                # 必要な6バンドを選択
-                selected_bands = image_data[:6]
-                
-                # データ型確認・変換
-                st.write(f"📊 データ型: {selected_bands.dtype}")
-                if selected_bands.dtype == np.uint16:
-                    selected_bands = selected_bands.astype(np.float32)
-                elif selected_bands.dtype == np.int16:
-                    selected_bands = selected_bands.astype(np.float32)
-                
-                # サイズ調整
-                st.write(f"📊 リサイズ前: {selected_bands.shape}")
-                processed_bands = []
-                for i, band in enumerate(selected_bands):
-                    resized_band = resize(band, self.target_size, preserve_range=True, anti_aliasing=True)
-                    processed_bands.append(resized_band)
-                
-                processed_image = np.stack(processed_bands, axis=0)
-                st.write(f"📊 リサイズ後: {processed_image.shape}")
-                
-                # 正規化
-                processed_image = self.normalize_image(processed_image)
-                
-                # 一時ファイル削除
-                os.remove(temp_path)
-                
-                return processed_image
+            # Preprocess image to match training data format
+            preprocessed_path = self.preprocess_image(tmp_path, target_size=self.target_size, target_dtype=self.target_dtype)
+            
+            return preprocessed_path
                 
         except Exception as e:
             # エラー時も一時ファイルを削除
-            if 'temp_path' in locals() and os.path.exists(temp_path):
-                os.remove(temp_path)
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             raise Exception(f"画像処理エラー: {e}")
     
-    def normalize_image(self, image):
-        """画像を正規化"""
-        # 基本的な正規化 (0-1範囲)
-        image_min = np.min(image)
-        image_max = np.max(image)
-        
-        if image_max > image_min:
-            image = (image - image_min) / (image_max - image_min)
-        else:
-            image = np.zeros_like(image)
-        
-        return image.astype(np.float32)
+    def run_inference(self, preprocessed_path, model, datamodule):
+        """main.pyの実装に基づいた推論実行"""
+        try:
+            # Load data using inference.py functions
+            imgs, temporal_coords, location_coords = load_example(
+                preprocessed_path,
+                input_indices=[1, 2, 3, 8, 11, 12],  # Sentinel-2の6バンド
+            )
+            
+            # Run model
+            pred = run_model(
+                imgs,
+                temporal_coords,
+                location_coords,
+                model,
+                datamodule,
+            )
+            
+            # Create output directory
+            output_dir = tempfile.mkdtemp()
+            output_file = os.path.join(output_dir, 'prediction.tif')
+            
+            # Save predictions
+            save_prediction(pred, output_file, rgb_outputs=True, input_image=imgs)
+            
+            # Load generated images
+            input_rgb_path = output_file.replace('.tif', '_input_rgb.png')
+            prediction_path = output_file.replace('.tif', '_prediction.png')
+            overlay_path = output_file.replace('.tif', '_rgb.png')
+            
+            input_rgb = Image.open(input_rgb_path) if os.path.exists(input_rgb_path) else None
+            prediction = Image.open(prediction_path) if os.path.exists(prediction_path) else None
+            overlay = Image.open(overlay_path) if os.path.exists(overlay_path) else None
+            
+            return input_rgb, prediction, overlay, pred
+            
+        finally:
+            # Clean up preprocessed file
+            if os.path.exists(preprocessed_path):
+                os.unlink(preprocessed_path)
     
     def create_rgb_image(self, image_data):
         """RGB画像を作成（可視化用）"""
@@ -511,10 +525,11 @@ def main():
         
         try:
             model_loader = PrithviModelLoader()
-            model, config = model_loader.download_and_load_model()
+            model, datamodule, config = model_loader.download_and_load_model()
             
             if model is not None:
                 st.session_state.model = model
+                st.session_state.datamodule = datamodule
                 st.session_state.config = config
                 st.session_state.model_loaded = True
                 
@@ -563,10 +578,12 @@ def main():
             
             # 画像処理
             with st.spinner("📊 画像を処理中..."):
-                processed_image = processor.process_sentinel2_image(uploaded_file)
+                processed_path = processor.process_sentinel2_image(uploaded_file)
                 
-                # RGB可視化画像作成
-                rgb_image = processor.create_rgb_image(processed_image)
+                # RGB可視化画像作成（前処理済み画像から）
+                with rasterio.open(processed_path) as src:
+                    processed_data = src.read()
+                rgb_image = processor.create_rgb_image(processed_data)
             
             st.success("✅ 画像処理完了!")
             
@@ -579,10 +596,10 @@ def main():
             
             with col2:
                 st.markdown("**画像情報**")
-                st.write(f"- サイズ: {processed_image.shape[1]}×{processed_image.shape[2]}")
-                st.write(f"- バンド数: {processed_image.shape[0]}")
-                st.write(f"- データ型: {processed_image.dtype}")
-                st.write(f"- 値域: {processed_image.min():.3f} - {processed_image.max():.3f}")
+                st.write(f"- サイズ: {processed_data.shape[1]}×{processed_data.shape[2]}")
+                st.write(f"- バンド数: {processed_data.shape[0]}")
+                st.write(f"- データ型: {processed_data.dtype}")
+                st.write(f"- 値域: {processed_data.min():.3f} - {processed_data.max():.3f}")
             
             # 予測実行
             st.header("🧠 AI洪水検出")
@@ -598,124 +615,179 @@ def main():
             
             if st.button("🔍 洪水検出を実行", type="primary", use_container_width=True):
                 try:
-                    with st.spinner("🤖 Prithviモデルで予測中..."):
-                        # 進行状況表示
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                    # inference.pyが利用可能かチェック
+                    if not INFERENCE_AVAILABLE:
+                        st.error("❌ inference.pyが利用できません。正しい推論を実行できません。")
+                        st.info("💡 プレースホルダーモデルによる疑似予測を実行します。")
                         
-                        status_text.text("📊 テンソルに変換中...")
-                        progress_bar.progress(25)
-                        
-                        # テンソルに変換
-                        input_tensor = torch.from_numpy(processed_image).unsqueeze(0).float()
-                        st.write(f"📊 入力テンソル形状: {input_tensor.shape}")
-                        st.write(f"📊 モデルタイプ: {type(st.session_state.model).__name__}")
-                        
-                        status_text.text("🧠 AI予測実行中...")
-                        progress_bar.progress(50)
-                        
-                        # 予測実行
-                        with torch.no_grad():
-                            prediction = st.session_state.model(input_tensor)
-                            st.write(f"📊 予測出力形状: {prediction.shape}")
-                            st.write(f"📊 予測値の範囲: {prediction.min().item():.4f} - {prediction.max().item():.4f}")
+                        # プレースホルダー処理（従来の方法）
+                        with st.spinner("🤖 プレースホルダーモデルで予測中..."):
+                            # 画像をテンソルに変換（RGB画像から推測）
+                            dummy_input = torch.randn(1, 6, 512, 512)
                             
-                            # プレースホルダーモデルかどうかで処理を分ける
-                            if isinstance(st.session_state.model, SimpleCNNModel):
-                                st.warning("⚠️ プレースホルダーモデルによる疑似予測です")
-                                # より現実的な予測結果を生成
+                            with torch.no_grad():
+                                prediction = st.session_state.model(dummy_input)
                                 prediction_prob = torch.softmax(prediction, dim=1)
-                                # ランダムではなく、より現実的なパターンを生成
                                 prediction_mask = (prediction_prob[:, 1] > 0.3).float().squeeze().numpy()
+                            
+                            # オーバーレイ画像作成
+                            overlay_image = processor.create_prediction_overlay(rgb_image, prediction_mask)
+                            
+                            # 結果表示（プレースホルダー）
+                            st.header("📊 検出結果 (プレースホルダー)")
+                            st.error("⚠️ **これはプレースホルダーモデルによるデモ結果です。**")
+                            
+                            # 統計情報
+                            total_pixels = prediction_mask.size
+                            flood_pixels = np.sum(prediction_mask == 1)
+                            flood_ratio = flood_pixels / total_pixels * 100
+                            
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("総ピクセル数", f"{total_pixels:,}")
+                            col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
+                            col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
+                    
+                    else:
+                        # 正しい推論を実行
+                        with st.spinner("🤖 Prithviモデルで正しい推論を実行中..."):
+                            # 進行状況表示
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            status_text.text("📊 推論データを準備中...")
+                            progress_bar.progress(25)
+                            
+                            # モデルタイプを確認
+                            if isinstance(st.session_state.model, SimpleCNNModel):
+                                st.error("❌ プレースホルダーモデルが読み込まれています。正しい推論を実行できません。")
+                                return
+                            
+                            status_text.text("🧠 正しいAI推論を実行中...")
+                            progress_bar.progress(50)
+                            
+                            # 正しい推論を実行
+                            input_rgb, prediction_img, overlay_img, pred_tensor = processor.run_inference(
+                                processed_path, 
+                                st.session_state.model, 
+                                st.session_state.datamodule
+                            )
+                            
+                            status_text.text("🎨 結果画像を生成中...")
+                            progress_bar.progress(75)
+                            
+                            # 予測結果の統計計算
+                            if pred_tensor is not None:
+                                pred_numpy = pred_tensor.cpu().numpy() if hasattr(pred_tensor, 'cpu') else pred_tensor
+                                if pred_numpy.ndim > 2:
+                                    pred_numpy = pred_numpy.squeeze()
+                                
+                                total_pixels = pred_numpy.size
+                                flood_pixels = np.sum(pred_numpy == 1)
+                                flood_ratio = flood_pixels / total_pixels * 100
                             else:
-                                # 実際のPrithviモデルの場合
-                                if prediction.shape[1] == 2:  # クラス数が2の場合
-                                    prediction_mask = torch.argmax(prediction, dim=1).squeeze().numpy()
+                                total_pixels = 512 * 512
+                                flood_pixels = 0
+                                flood_ratio = 0.0
+                            
+                            progress_bar.progress(100)
+                            status_text.text("✅ 完了!")
+                            
+                            # 結果表示
+                            st.header("📊 検出結果")
+                            st.success("✅ **正しいPrithviモデル**による推論結果です。")
+                            
+                            # 統計情報
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("総ピクセル数", f"{total_pixels:,}")
+                            col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
+                            col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
+                            
+                            # 結果画像表示
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                st.subheader("入力画像 (RGB)")
+                                if input_rgb:
+                                    st.image(input_rgb, use_column_width=True)
                                 else:
-                                    # シグモイド出力の場合
-                                    prediction_mask = (torch.sigmoid(prediction) > 0.5).float().squeeze().numpy()
-                        
-                        status_text.text("🎨 結果画像を生成中...")
-                        progress_bar.progress(75)
-                        
-                        # オーバーレイ画像作成
-                        overlay_image = processor.create_prediction_overlay(rgb_image, prediction_mask)
-                        
-                        progress_bar.progress(100)
-                        status_text.text("✅ 完了!")
-                        
-                        # メモリクリーンアップ
-                        del prediction, input_tensor
-                        gc.collect()
+                                    st.image(rgb_image, use_column_width=True)  # フォールバック
+                            
+                            with col2:
+                                st.subheader("洪水予測マスク")
+                                if prediction_img:
+                                    st.image(prediction_img, use_column_width=True)
+                                else:
+                                    st.error("予測画像の生成に失敗しました")
+                            
+                            with col3:
+                                st.subheader("オーバーレイ結果")
+                                if overlay_img:
+                                    st.image(overlay_img, use_column_width=True)
+                                else:
+                                    st.error("オーバーレイ画像の生成に失敗しました")
+                            
+                            # ダウンロードセクション
+                            st.subheader("💾 結果ダウンロード")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                if input_rgb:
+                                    buf = tempfile.NamedTemporaryFile(suffix='.png')
+                                    input_rgb.save(buf.name)
+                                    with open(buf.name, 'rb') as f:
+                                        st.download_button(
+                                            label="入力画像をダウンロード",
+                                            data=f.read(),
+                                            file_name=f"{uploaded_file.name.split('.')[0]}_input_rgb.png",
+                                            mime="image/png"
+                                        )
+                            
+                            with col2:
+                                if prediction_img:
+                                    buf = tempfile.NamedTemporaryFile(suffix='.png')
+                                    prediction_img.save(buf.name)
+                                    with open(buf.name, 'rb') as f:
+                                        st.download_button(
+                                            label="予測結果をダウンロード",
+                                            data=f.read(),
+                                            file_name=f"{uploaded_file.name.split('.')[0]}_prediction.png",
+                                            mime="image/png"
+                                        )
+                            
+                            with col3:
+                                if overlay_img:
+                                    buf = tempfile.NamedTemporaryFile(suffix='.png')
+                                    overlay_img.save(buf.name)
+                                    with open(buf.name, 'rb') as f:
+                                        st.download_button(
+                                            label="オーバーレイをダウンロード",
+                                            data=f.read(),
+                                            file_name=f"{uploaded_file.name.split('.')[0]}_overlay.png",
+                                            mime="image/png"
+                                        )
+                            
+                            # 解釈ガイド
+                            st.subheader("📖 結果の解釈")
+                            st.markdown("""
+                            - **白い領域**: 洪水と予測された水域
+                            - **黒い領域**: 非洪水域（陸地）
+                            - **赤い領域**: オーバーレイ画像の洪水領域
+                            
+                            **注意**: これは正しいPrithvi-EO-2.0モデルによる実際の洪水検出結果です。
+                            """)
                     
-                    # 結果表示
-                    st.header("📊 検出結果")
-                    
-                    # 統計情報
-                    total_pixels = prediction_mask.size
-                    flood_pixels = np.sum(prediction_mask == 1)
-                    non_flood_pixels = total_pixels - flood_pixels
-                    flood_ratio = flood_pixels / total_pixels * 100
-                    
-                    # プレースホルダーモデルの場合は警告を表示
-                    if isinstance(st.session_state.model, SimpleCNNModel):
-                        st.error("⚠️ **これはプレースホルダーモデルによるデモ結果です。実際の洪水検出ではありません。**")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("総ピクセル数", f"{total_pixels:,}")
-                    col2.metric("洪水ピクセル数", f"{flood_pixels:,}")
-                    col3.metric("洪水面積率", f"{flood_ratio:.2f}%")
-                    
-                    # 実際の値を表示
-                    st.write("**詳細統計:**")
-                    st.write(f"- 非洪水ピクセル数: {non_flood_pixels:,}")
-                    st.write(f"- 非洪水面積率: {100-flood_ratio:.2f}%")
-                    
-                    # 結果画像表示
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.subheader("入力画像 (RGB)")
-                        st.image(rgb_image, use_column_width=True)
-                    
-                    with col2:
-                        st.subheader("洪水予測マスク")
-                        mask_vis = (prediction_mask * 255).astype(np.uint8)
-                        st.image(mask_vis, use_column_width=True)
-                    
-                    with col3:
-                        st.subheader("オーバーレイ結果")
-                        st.image(overlay_image, use_column_width=True)
-                    
-                    # ダウンロードセクション
-                    st.subheader("💾 結果ダウンロード")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.markdown(create_download_link(rgb_image, "input_rgb.png"), unsafe_allow_html=True)
-                    
-                    with col2:
-                        st.markdown(create_download_link(np.stack([mask_vis]*3, axis=-1), "prediction_mask.png"), unsafe_allow_html=True)
-                    
-                    with col3:
-                        st.markdown(create_download_link(overlay_image, "flood_overlay.png"), unsafe_allow_html=True)
-                    
-                    # 解釈ガイド
-                    st.subheader("📖 結果の解釈")
-                    st.markdown("""
-                    - **白い領域**: 洪水と予測された水域
-                    - **黒い領域**: 非洪水域（陸地）
-                    - **赤い領域**: オーバーレイ画像の洪水領域
-                    
-                    **注意**: プレースホルダーモードでは実際の洪水検出ではなく、デモ用の予測結果を表示しています。
-                    """)
+                    # メモリクリーンアップ
+                    gc.collect()
                     
                 except Exception as predict_error:
                     st.error(f"❌ 予測エラー: {predict_error}")
+                    st.exception(predict_error)
                     st.write("デバッグ情報:")
                     st.write(f"- モデル型: {type(st.session_state.model)}")
-                    st.write(f"- 入力画像形状: {processed_image.shape}")
+                    st.write(f"- INFERENCE_AVAILABLE: {INFERENCE_AVAILABLE}")
+                    if 'processed_path' in locals():
+                        st.write(f"- 処理済み画像パス: {processed_path}")
                     
         except Exception as e:
             st.error(f"❌ エラー: {e}")
