@@ -4,12 +4,28 @@ from PIL import Image
 import io
 import os
 import gc
-import torch
-import tempfile
-from huggingface_hub import hf_hub_download
-import rasterio
-from rasterio.plot import show
-import matplotlib.pyplot as plt
+
+# 条件付きインポート
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    st.warning("PyTorchが見つかりません。デモモードで動作します。")
+
+try:
+    from huggingface_hub import hf_hub_download
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
+try:
+    import rasterio
+    from rasterio.plot import show
+    import matplotlib.pyplot as plt
+    RASTERIO_AVAILABLE = True
+except ImportError:
+    RASTERIO_AVAILABLE = False
 
 # Streamlit設定
 st.set_page_config(
@@ -27,8 +43,20 @@ CACHE_DIR = "/tmp/prithvi_cache"
 @st.cache_resource
 def load_model():
     """Hugging Face Hubからモデルをダウンロード・ロード"""
+    
+    # 依存関係チェック
+    if not TORCH_AVAILABLE or not HF_AVAILABLE:
+        st.info("💡 必要な依存関係が不足しています。デモモードで動作します。")
+        return None, None
+    
     try:
-        with st.spinner("Prithvi-EO-2.0モデルをロード中...（初回は数分かかります）"):
+        # クラウド環境での制約チェック
+        if os.environ.get("RENDER") or os.environ.get("STREAMLIT_CLOUD"):
+            st.info("💡 クラウド環境検出: メモリ制約によりデモモードで動作します")
+            return None, None
+            
+        with st.spinner("Prithvi-EO-2.0モデルをロード中..."):
+            
             # モデルファイルをダウンロード
             model_path = hf_hub_download(
                 repo_id=MODEL_NAME,
@@ -38,22 +66,47 @@ def load_model():
             
             # PyTorchモデルをロード
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = torch.load(model_path, map_location=device)
-            model.eval()
+            checkpoint = torch.load(model_path, map_location=device)
             
-            st.success("✅ Prithvi-EO-2.0モデルをロードしました")
-            return model, device
+            # チェックポイント構造をデバッグ
+            st.info(f"モデルファイルの構造: {type(checkpoint)}")
+            if isinstance(checkpoint, dict):
+                st.info(f"利用可能なキー: {list(checkpoint.keys())}")
+            
+            # チェックポイントから適切にモデルを抽出
+            if isinstance(checkpoint, dict):
+                if 'model' in checkpoint:
+                    model = checkpoint['model']
+                elif 'state_dict' in checkpoint:
+                    st.warning("state_dict形式のモデルは現在サポートされていません")
+                    return None, None
+                else:
+                    st.warning("未知のモデル形式です。利用可能な形式を確認してください。")
+                    return None, None
+            else:
+                model = checkpoint
+            
+            # モデルを評価モードに設定
+            if hasattr(model, 'eval'):
+                model.eval()
+                st.success("✅ Prithvi-EO-2.0モデルをロードしました")
+                return model, device
+            else:
+                st.warning("モデルオブジェクトが正しくありません")
+                return None, None
             
     except Exception as e:
-        st.error(f"モデルロードエラー: {str(e)}")
-        st.info("デモモードに切り替えます...")
+        st.info(f"モデルロードをスキップしました: {str(e)}")
+        st.info("💡 デモモードで動作します")
         return None, None
 
 def preprocess_image(image_array, target_size=(512, 512)):
     """画像前処理"""
     try:
+        if not TORCH_AVAILABLE:
+            return None
+            
         # RGBチャンネルを6バンドに変換（Prithvi-EO-2.0用）
-        # Blue, Green, Red, Narrow NIR, SWIR1, SWIR2
         if len(image_array.shape) == 3 and image_array.shape[2] == 3:
             # RGB画像を6バンドに拡張（デモ用）
             blue = image_array[:, :, 2]   # B
@@ -83,7 +136,7 @@ def preprocess_image(image_array, target_size=(512, 512)):
 def predict_flood(model, device, input_tensor):
     """洪水予測実行"""
     try:
-        if model is None or device is None:
+        if not TORCH_AVAILABLE or model is None or device is None:
             return None
             
         with torch.no_grad():
