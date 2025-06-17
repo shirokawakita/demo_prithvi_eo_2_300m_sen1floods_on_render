@@ -380,15 +380,43 @@ class ImageProcessor:
     def process_sentinel2_image(self, uploaded_file):
         """Sentinel-2画像を処理（main.pyの実装に基づく）"""
         try:
-            # Save uploaded file temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_path = tmp_file.name
+            # main.pyと同じように画像を読み込み
+            if uploaded_file.name.lower().endswith(('.tif', '.tiff')):
+                # TIFFファイルの場合はrasterioで読み込み（多バンド対応）
+                import tempfile
+                import rasterio
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = tmp_file.name
+                
+                try:
+                    with rasterio.open(tmp_path) as src:
+                        # 全バンドを読み込み
+                        img_data = src.read()  # Shape: (bands, height, width)
+                        profile = src.profile.copy()
+                        
+                        st.info(f"TIFFファイル読み込み: バンド数={img_data.shape[0]}, サイズ={img_data.shape[1]}x{img_data.shape[2]}")
+                        
+                        # (bands, height, width) → (height, width, bands) に変換
+                        rgb_image = img_data.transpose(1, 2, 0)
+                        
+                        # データ型確認
+                        st.info(f"データ型: {rgb_image.dtype}, 値域: {rgb_image.min()}-{rgb_image.max()}")
+                        
+                finally:
+                    os.unlink(tmp_path)
+                    
+            else:
+                # PNG/JPEGなどの通常画像ファイル
+                image = Image.open(uploaded_file)
+                rgb_image = np.array(image)
+                
+                st.info(f"通常画像ファイル読み込み: 形状={rgb_image.shape}, データ型={rgb_image.dtype}")
             
-            # Preprocess image to match training data format
-            preprocessed_path = self.preprocess_image(tmp_path, target_size=self.target_size, target_dtype=self.target_dtype)
+            st.success("✅ 画像処理完了!")
             
-            return preprocessed_path
+            return rgb_image
                 
         except Exception as e:
             # エラー時も一時ファイルを削除
@@ -551,24 +579,49 @@ def preprocess_image_like_main(img_array, target_size=(512, 512), target_dtype=n
         # main.pyのpreprocess_image関数と同じ処理
         st.info(f"main.py方式で前処理中... (目標サイズ: {target_size}, データ型: {target_dtype})")
         
-        # RGB画像を6バンドに拡張（Sentinel-2をシミュレーション）
-        if len(img_array.shape) == 3 and img_array.shape[-1] == 3:
-            # RGB to 6-band simulation
-            rgb_array = img_array.astype(np.float32)
-            
-            # [BLUE, GREEN, RED, NIR, SWIR1, SWIR2]の順序で6バンドを作成
-            blue = rgb_array[:, :, 2]    # B channel
-            green = rgb_array[:, :, 1]   # G channel  
-            red = rgb_array[:, :, 0]     # R channel
-            nir = 255 - red              # NIRをREDの逆として近似
-            swir1 = green * 0.8          # SWIR1をGREENの80%として近似
-            swir2 = blue * 0.7           # SWIR2をBLUEの70%として近似
-            
-            # (height, width, 6) → (6, height, width) の形状に変換
-            img = np.stack([blue, green, red, nir, swir1, swir2], axis=0)
+        # main.pyと同じように実際の画像バンドを使用
+        if len(img_array.shape) == 3:
+            # 画像の形状を確認
+            if img_array.shape[-1] >= 6:
+                # 既に6バンド以上ある場合は、最初の6バンドを使用
+                st.info(f"多バンド画像を検出: {img_array.shape[-1]}バンド")
+                # (height, width, bands) → (bands, height, width) の形状に変換
+                img = img_array[:, :, :6].transpose(2, 0, 1)
+                st.info("実際の6バンドを使用 [Band1, Band2, Band3, Band4, Band5, Band6]")
+                
+            elif img_array.shape[-1] == 3:
+                # RGB画像の場合は、main.pyのように処理
+                st.info("RGB画像を検出、6バンドに拡張")
+                rgb_array = img_array.astype(np.float32)
+                
+                # main.pyと同じバンド拡張方法
+                # 実際のSentinel-2バンドをシミュレーション
+                blue = rgb_array[:, :, 2]    # Blue band
+                green = rgb_array[:, :, 1]   # Green band  
+                red = rgb_array[:, :, 0]     # Red band
+                
+                # NIR, SWIR1, SWIR2は実際のバンドがない場合のシミュレーション
+                # （main.pyでは実際のSentinel-2データを想定）
+                nir = 255 - red              # NIRシミュレーション
+                swir1 = green * 0.8          # SWIR1シミュレーション
+                swir2 = blue * 0.7           # SWIR2シミュレーション
+                
+                # (height, width, 6) → (6, height, width) の形状に変換
+                img = np.stack([blue, green, red, nir, swir1, swir2], axis=0)
+                st.warning("⚠️ RGB画像のため、NIR/SWIRはシミュレーション値を使用")
+                
+            else:
+                # その他の場合
+                img = img_array.transpose(2, 0, 1)
+                st.info(f"画像を変換: {img_array.shape} → {img.shape}")
         else:
-            # 既に多バンド画像の場合
-            img = img_array.transpose(2, 0, 1) if len(img_array.shape) == 3 else img_array
+            # 2D画像の場合
+            if len(img_array.shape) == 2:
+                # 単一バンドを6バンドに複製
+                img = np.stack([img_array] * 6, axis=0)
+                st.info("単一バンド画像を6バンドに複製")
+            else:
+                img = img_array
         
         st.info(f"元画像: バンド数={img.shape[0]}, サイズ={img.shape[1]}x{img.shape[2]}, データ型={img.dtype}")
         
@@ -856,17 +909,39 @@ def main():
     # 画像処理と予測
     if uploaded_file is not None:
         try:
-            # ファイル情報表示
-            st.success(f"✅ ファイル受信: {uploaded_file.name} ({uploaded_file.size / 1024 / 1024:.1f} MB)")
-            
-            # 画像処理
-            with st.spinner("📊 画像を処理中..."):
-                processed_path = processor.process_sentinel2_image(uploaded_file)
+            # main.pyと同じように画像を読み込み
+            if uploaded_file.name.lower().endswith(('.tif', '.tiff')):
+                # TIFFファイルの場合はrasterioで読み込み（多バンド対応）
+                import tempfile
+                import rasterio
                 
-                # RGB可視化画像作成（前処理済み画像から）
-                with rasterio.open(processed_path) as src:
-                    processed_data = src.read()
-                rgb_image = processor.create_rgb_image(processed_data)
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = tmp_file.name
+                
+                try:
+                    with rasterio.open(tmp_path) as src:
+                        # 全バンドを読み込み
+                        img_data = src.read()  # Shape: (bands, height, width)
+                        profile = src.profile.copy()
+                        
+                        st.info(f"TIFFファイル読み込み: バンド数={img_data.shape[0]}, サイズ={img_data.shape[1]}x{img_data.shape[2]}")
+                        
+                        # (bands, height, width) → (height, width, bands) に変換
+                        rgb_image = img_data.transpose(1, 2, 0)
+                        
+                        # データ型確認
+                        st.info(f"データ型: {rgb_image.dtype}, 値域: {rgb_image.min()}-{rgb_image.max()}")
+                        
+                finally:
+                    os.unlink(tmp_path)
+                    
+            else:
+                # PNG/JPEGなどの通常画像ファイル
+                image = Image.open(uploaded_file)
+                rgb_image = np.array(image)
+                
+                st.info(f"通常画像ファイル読み込み: 形状={rgb_image.shape}, データ型={rgb_image.dtype}")
             
             st.success("✅ 画像処理完了!")
             
