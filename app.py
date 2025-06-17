@@ -32,14 +32,16 @@ INFERENCE_AVAILABLE = False
 TERRATORCH_ERROR = None
 
 try:
-    # main.pyと同じimport
+    # inference.pyから直接import（main.pyと同じ方式）
     from inference import (
-        SemanticSegmentationTask,
-        Sen1Floods11NonGeoDataModule,
         load_example,
         run_model,
         save_prediction
     )
+    # terratorch関連は直接import
+    from terratorch.tasks import SemanticSegmentationTask
+    from terratorch.datamodules import Sen1Floods11NonGeoDataModule
+    
     INFERENCE_AVAILABLE = True
     st.success("✅ terratorch + inference.py が正常に読み込まれました")
     
@@ -523,44 +525,77 @@ def initialize_model():
             # main.pyと同じterratorch使用
             st.info("🔄 main.pyと同じ方式でPrithvi-EO-2.0モデルを初期化中...")
             try:
+                # main.pyと同じmodel_args設定
+                model_args = {
+                    "backbone_pretrained": True,
+                    "backbone": "prithvi_eo_v2_300_tl",
+                    "decoder": "UperNetDecoder",
+                    "decoder_channels": 256,
+                    "decoder_scale_modules": True,
+                    "num_classes": 2,
+                    "rescale": True,
+                    "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                    "head_dropout": 0.1,
+                    "necks": [
+                        {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
+                        {"name": "ReshapeTokensToImage"},
+                    ],
+                }
+                
                 # main.pyと同じSemanticSegmentationTask
                 model = SemanticSegmentationTask(
-                    model="prithvi_eo_2_300m_sen1floods",
-                    backbone="prithvi_eo_2_300m",
-                    backbone_pretrained="prithvi_eo_2_300m.pt",
-                    in_channels=6,
-                    num_classes=2,
+                    model_args=model_args,
+                    model_factory="EncoderDecoderFactory",
+                    loss="ce",
                     ignore_index=-1,
-                    num_frames=1,
-                    pretrained=True,
+                    lr=0.001,
                     freeze_backbone=False,
                     freeze_decoder=False,
+                    plot_on_val=10,
                 )
                 
-                # main.pyと同じデータモジュール
-                datamodule = Sen1Floods11NonGeoDataModule(
-                    batch_size=1,
-                    num_workers=0,
-                    val_split=0.2,
-                    test_split=0.1,
-                    means=[
-                        1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392,
-                        1263.73947144, 1645.40315126
-                    ],
-                    stds=[
-                        633.15169573, 650.2842772, 712.12507725, 965.23119807,
-                        948.9819932, 1108.06650639
-                    ]
-                )
+                # モデルファイルが存在する場合はロード
+                checkpoint_path = 'Prithvi-EO-V2-300M-TL-Sen1Floods11.pt'
+                if os.path.exists(checkpoint_path):
+                    st.info("🔄 チェックポイントを読み込み中...")
+                    checkpoint_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))["state_dict"]
+                    new_state_dict = {}
+                    for k, v in checkpoint_dict.items():
+                        if k.startswith("model.encoder._timm_module."):
+                            new_key = k.replace("model.encoder._timm_module.", "model.encoder.")
+                            new_state_dict[new_key] = v
+                        else:
+                            new_state_dict[k] = v
+                    
+                    model.load_state_dict(new_state_dict)
+                    st.success("✅ チェックポイント読み込み完了")
+                else:
+                    st.warning("⚠️ チェックポイントファイルが見つかりません（事前学習済みモデルを使用）")
+                
+                model.eval()
+                
+                # main.pyと同じデータモジュール（設定なしで初期化）
+                # config.yamlがないので、基本設定で初期化
+                config = {
+                    'batch_size': 1,
+                    'num_workers': 0,
+                    'val_split': 0.2,
+                    'test_split': 0.1,
+                    'means': [1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392, 1263.73947144, 1645.40315126],
+                    'stds': [633.15169573, 650.2842772, 712.12507725, 965.23119807, 948.9819932, 1108.06650639]
+                }
+                
+                datamodule = Sen1Floods11NonGeoDataModule(config)
                 
                 st.session_state.model = model
                 st.session_state.data_module = datamodule
-                st.session_state.config = {}
+                st.session_state.config = config
                 st.success("✅ **terratorch使用**: 実際のPrithvi-EO-2.0モデル初期化完了!")
                 return True
                 
             except Exception as e:
                 st.error(f"❌ terratorch Prithviモデル初期化エラー: {e}")
+                st.error(f"詳細エラー: {str(e)}")
                 raise e
                 
         else:
@@ -1029,18 +1064,53 @@ def main():
                         # terratorch使用時はmain.pyと同じ方式
                         if INFERENCE_AVAILABLE == True:
                             st.info("🔄 main.pyと同じ方式で推論実行中...")
-                            # main.pyと同じrun_model関数を使用
-                            prediction = run_model(
-                                processed_tensor, 
-                                st.session_state.model, 
-                                st.session_state.data_module
-                            )
                             
-                            # 予測結果からマスクを作成
-                            flood_prob = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
-                            flood_mask = flood_prob > 0.5  # 50%以上で洪水判定
+                            # main.pyと同じload_example関数を使用
+                            # processed_tensorではなく、一時ファイルから読み込み
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.tif') as tmp_file:
+                                # processed_imageを一時ファイルに保存
+                                import rasterio
+                                profile = {
+                                    'driver': 'GTiff',
+                                    'height': processed_image.shape[1],
+                                    'width': processed_image.shape[2],
+                                    'count': processed_image.shape[0],
+                                    'dtype': processed_image.dtype,
+                                    'crs': 'EPSG:4326',
+                                    'transform': rasterio.transform.from_bounds(0, 0, 1, 1, processed_image.shape[2], processed_image.shape[1])
+                                }
+                                
+                                with rasterio.open(tmp_file.name, 'w', **profile) as dst:
+                                    dst.write(processed_image)
+                                
+                                temp_path = tmp_file.name
                             
-                            st.success("✅ main.py方式での推論完了")
+                            try:
+                                # main.pyと同じload_example関数を使用
+                                imgs, temporal_coords, location_coords = load_example(
+                                    temp_path,
+                                    input_indices=[0, 1, 2, 3, 4, 5],  # 6バンドすべて使用
+                                )
+                                
+                                # main.pyと同じrun_model関数を使用
+                                prediction = run_model(
+                                    imgs,
+                                    temporal_coords,
+                                    location_coords,
+                                    st.session_state.model,
+                                    st.session_state.data_module,
+                                )
+                                
+                                # 予測結果からマスクを作成
+                                flood_prob = prediction[0, 1]  # バッチ0、クラス1（洪水）
+                                flood_mask = flood_prob > 0.5  # 50%以上で洪水判定
+                                
+                                st.success("✅ main.py方式での推論完了")
+                                
+                            finally:
+                                # 一時ファイルを削除
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
                         else:
                             # フォールバック時は独自実装
                             flood_mask, flood_prob = create_realistic_flood_prediction(
