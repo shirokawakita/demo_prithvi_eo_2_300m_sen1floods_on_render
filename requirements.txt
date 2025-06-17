@@ -12,3 +12,11 @@ matplotlib>=3.7.0
 opencv-python-headless>=4.8.0
 requests>=2.31.0
 psutil>=5.9.0
+einops>=0.7.0
+lightning>=2.0.0
+timm>=0.9.0
+segmentation-models-pytorch>=0.3.0
+albumentations>=1.3.0
+kornia>=0.7.0
+# terratorch - main.pyと同じ環境にするため追加
+terratorch
