@@ -38,9 +38,14 @@ try:
         run_model,
         save_prediction
     )
-    # terratorch関連は直接import
+    # terratorch関連は段階的にimport
+    st.info("🔄 terratorch関連モジュールを読み込み中...")
+    
     from terratorch.tasks import SemanticSegmentationTask
+    st.info("✅ SemanticSegmentationTask読み込み完了")
+    
     from terratorch.datamodules import Sen1Floods11NonGeoDataModule
+    st.info("✅ Sen1Floods11NonGeoDataModule読み込み完了")
     
     INFERENCE_AVAILABLE = True
     st.success("✅ terratorch + inference.py が正常に読み込まれました")
@@ -50,6 +55,14 @@ except ImportError as e:
     st.error(f"❌ terratorch/inference.pyのインポートエラー: {e}")
     st.warning("⚠️ 独自実装のフォールバックモデルを使用します")
     INFERENCE_AVAILABLE = False
+    
+    # 部分的にimportが成功している場合の処理
+    try:
+        from inference import load_example, run_model, save_prediction
+        st.info("✅ inference.py関数は読み込み成功")
+        INFERENCE_PARTIAL = True
+    except:
+        INFERENCE_PARTIAL = False
 
 # イベントループ問題を修正
 def fix_event_loop():
@@ -525,34 +538,67 @@ def initialize_model():
             # main.pyと同じterratorch使用
             st.info("🔄 main.pyと同じ方式でPrithvi-EO-2.0モデルを初期化中...")
             try:
-                # main.pyと同じmodel_args設定
-                model_args = {
-                    "backbone_pretrained": True,
-                    "backbone": "prithvi_eo_v2_300_tl",
-                    "decoder": "UperNetDecoder",
-                    "decoder_channels": 256,
-                    "decoder_scale_modules": True,
-                    "num_classes": 2,
-                    "rescale": True,
-                    "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-                    "head_dropout": 0.1,
-                    "necks": [
-                        {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
-                        {"name": "ReshapeTokensToImage"},
-                    ],
-                }
+                # terratorch設定を段階的に初期化
+                st.info("🔧 モデル設定を準備中...")
                 
-                # main.pyと同じSemanticSegmentationTask
-                model = SemanticSegmentationTask(
-                    model_args=model_args,
-                    model_factory="EncoderDecoderFactory",
-                    loss="ce",
-                    ignore_index=-1,
-                    lr=0.001,
-                    freeze_backbone=False,
-                    freeze_decoder=False,
-                    plot_on_val=10,
-                )
+                try:
+                    # main.pyと同じmodel_args設定
+                    model_args = {
+                        "backbone_pretrained": True,
+                        "backbone": "prithvi_eo_v2_300_tl",
+                        "decoder": "UperNetDecoder",
+                        "decoder_channels": 256,
+                        "decoder_scale_modules": True,
+                        "num_classes": 2,
+                        "rescale": True,
+                        "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                        "head_dropout": 0.1,
+                        "necks": [
+                            {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
+                            {"name": "ReshapeTokensToImage"},
+                        ],
+                    }
+                    st.info("✅ モデル設定準備完了")
+                    
+                    # main.pyと同じSemanticSegmentationTask
+                    st.info("🔧 SemanticSegmentationTaskを初期化中...")
+                    model = SemanticSegmentationTask(
+                        model_args=model_args,
+                        model_factory="EncoderDecoderFactory",
+                        loss="ce",
+                        ignore_index=-1,
+                        lr=0.001,
+                        freeze_backbone=False,
+                        freeze_decoder=False,
+                        plot_on_val=10,
+                    )
+                    st.info("✅ SemanticSegmentationTask初期化完了")
+                    
+                except Exception as model_init_error:
+                    st.error(f"❌ モデル初期化エラー: {model_init_error}")
+                    st.warning("🔄 簡易モデル初期化を試行中...")
+                    
+                    # より簡単な初期化を試行
+                    try:
+                        # 最小限の設定でモデル初期化
+                        simple_model_args = {
+                            "backbone": "prithvi_eo_v2_300_tl",
+                            "decoder": "UperNetDecoder",
+                            "num_classes": 2,
+                            "backbone_bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
+                        }
+                        
+                        model = SemanticSegmentationTask(
+                            model_args=simple_model_args,
+                            model_factory="EncoderDecoderFactory",
+                            loss="ce",
+                            ignore_index=-1,
+                        )
+                        st.success("✅ 簡易モデル初期化成功")
+                        
+                    except Exception as simple_error:
+                        st.error(f"❌ 簡易モデル初期化も失敗: {simple_error}")
+                        raise simple_error
                 
                 # モデルファイルが存在する場合はロード
                 checkpoint_path = 'Prithvi-EO-V2-300M-TL-Sen1Floods11.pt'
@@ -576,16 +622,25 @@ def initialize_model():
                 
                 # main.pyと同じデータモジュール（設定なしで初期化）
                 # config.yamlがないので、基本設定で初期化
-                config = {
-                    'batch_size': 1,
-                    'num_workers': 0,
-                    'val_split': 0.2,
-                    'test_split': 0.1,
-                    'means': [1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392, 1263.73947144, 1645.40315126],
-                    'stds': [633.15169573, 650.2842772, 712.12507725, 965.23119807, 948.9819932, 1108.06650639]
-                }
-                
-                datamodule = Sen1Floods11NonGeoDataModule(config)
+                st.info("🔧 データモジュールを初期化中...")
+                try:
+                    config = {
+                        'batch_size': 1,
+                        'num_workers': 0,
+                        'val_split': 0.2,
+                        'test_split': 0.1,
+                        'means': [1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392, 1263.73947144, 1645.40315126],
+                        'stds': [633.15169573, 650.2842772, 712.12507725, 965.23119807, 948.9819932, 1108.06650639]
+                    }
+                    
+                    datamodule = Sen1Floods11NonGeoDataModule(config)
+                    st.info("✅ データモジュール初期化完了")
+                    
+                except Exception as dm_error:
+                    st.error(f"❌ データモジュール初期化エラー: {dm_error}")
+                    # データモジュールなしで続行
+                    datamodule = None
+                    st.warning("⚠️ データモジュールなしで続行")
                 
                 st.session_state.model = model
                 st.session_state.data_module = datamodule
@@ -596,7 +651,17 @@ def initialize_model():
             except Exception as e:
                 st.error(f"❌ terratorch Prithviモデル初期化エラー: {e}")
                 st.error(f"詳細エラー: {str(e)}")
-                raise e
+                import traceback
+                st.error(f"スタックトレース: {traceback.format_exc()}")
+                
+                # フォールバックモードに切り替え
+                st.warning("⚠️ フォールバックモードに切り替えます")
+                fallback_model = AdvancedPrithviModel()
+                fallback_model.eval()
+                st.session_state.model = fallback_model
+                st.session_state.data_module = None
+                st.session_state.config = {}
+                return True
                 
         else:
             # terratorch未使用の場合はフォールバック
@@ -881,6 +946,26 @@ def main():
     
     # システム情報表示
     show_system_info()
+    
+    # デバッグ情報表示
+    with st.sidebar:
+        st.subheader("🔧 デバッグ情報")
+        st.write(f"INFERENCE_AVAILABLE: {INFERENCE_AVAILABLE}")
+        if TERRATORCH_ERROR:
+            st.error(f"terratorch エラー: {TERRATORCH_ERROR}")
+        
+        # Pythonモジュール確認
+        import sys
+        st.write(f"Python version: {sys.version}")
+        
+        # 重要モジュールの確認
+        modules_to_check = ['torch', 'terratorch', 'lightning', 'timm']
+        for module in modules_to_check:
+            try:
+                __import__(module)
+                st.success(f"✅ {module}")
+            except ImportError as e:
+                st.error(f"❌ {module}: {e}")
     
     # モデル初期化
     if 'model_loaded' not in st.session_state:
