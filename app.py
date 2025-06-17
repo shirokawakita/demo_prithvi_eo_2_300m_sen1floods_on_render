@@ -543,131 +543,118 @@ def initialize_model():
         st.error(f"❌ モデル初期化全体エラー: {e}")
         return False
 
-def create_sentinel2_rgb_display(processed_tensor):
-    """image_processor.pyに基づくシンプルなRGB表示作成"""
-    try:
-        # processed_tensorから生データを取得
-        # バッチ次元を除去: (1, 6, 512, 512) -> (6, 512, 512)
-        bands_data = processed_tensor[0].cpu().numpy()
-        
-        # image_processor.pyと同じ方法でRGB作成
-        # バンド順序: [BLUE(0), GREEN(1), RED(2), NIR(3), SWIR1(4), SWIR2(5)]
-        # RGB表示: RED(2), GREEN(1), BLUE(0)
-        red_band = bands_data[2]    # (512, 512)
-        green_band = bands_data[1]  # (512, 512)
-        blue_band = bands_data[0]   # (512, 512)
-        
-        # RGB画像を作成: (512, 512, 3)
-        rgb_image = np.stack([red_band, green_band, blue_band], axis=-1)
-        
-        # image_processor.pyと同じ正規化方法
-        # 0-255に正規化
-        rgb_min = rgb_image.min()
-        rgb_max = rgb_image.max()
-        
-        if rgb_max > rgb_min:
-            rgb_normalized = ((rgb_image - rgb_min) / (rgb_max - rgb_min) * 255)
-        else:
-            rgb_normalized = rgb_image * 255
-             
-        rgb_result = np.clip(rgb_normalized, 0, 255).astype(np.uint8)
-        
-        # 形状確認
-        st.info(f"🔍 RGB画像形状: {rgb_result.shape}")
-        
-        return rgb_result
-        
-    except Exception as e:
-        st.warning(f"⚠️ Sentinel-2 RGB作成エラー: {e}")
-        st.error(f"🔍 デバッグ情報: processed_tensor.shape = {processed_tensor.shape}")
-        return None
 
-def preprocess_image_standalone(img_array):
-    """image_processor.pyに基づくシンプルな前処理"""
+
+def preprocess_image_like_main(img_array, target_size=(512, 512), target_dtype=np.int16):
+    """main.pyと同じ前処理方法"""
     try:
-        if img_array.shape[-1] == 3:  # RGB image
+        # main.pyのpreprocess_image関数と同じ処理
+        st.info(f"main.py方式で前処理中... (目標サイズ: {target_size}, データ型: {target_dtype})")
+        
+        # RGB画像を6バンドに拡張（Sentinel-2をシミュレーション）
+        if len(img_array.shape) == 3 and img_array.shape[-1] == 3:
             # RGB to 6-band simulation
             rgb_array = img_array.astype(np.float32)
             
-            # image_processor.pyのバンドマッピングに合わせて6バンドを作成
-            # [BLUE(B2), GREEN(B3), RED(B4), NIR_NARROW(B8A), SWIR1(B11), SWIR2(B12)]
-            blue = rgb_array[:, :, 2]    # B channel → BLUE(B2)
-            green = rgb_array[:, :, 1]   # G channel → GREEN(B3)
-            red = rgb_array[:, :, 0]     # R channel → RED(B4)
+            # [BLUE, GREEN, RED, NIR, SWIR1, SWIR2]の順序で6バンドを作成
+            blue = rgb_array[:, :, 2]    # B channel
+            green = rgb_array[:, :, 1]   # G channel  
+            red = rgb_array[:, :, 0]     # R channel
+            nir = 255 - red              # NIRをREDの逆として近似
+            swir1 = green * 0.8          # SWIR1をGREENの80%として近似
+            swir2 = blue * 0.7           # SWIR2をBLUEの70%として近似
             
-            # NIRとSWIRをシミュレーション
-            nir = np.clip(255 - red, 0, 255)        # Simulate NIR_NARROW(B8A)
-            swir1 = np.clip(green * 0.8, 0, 255)    # Simulate SWIR1(B11)
-            swir2 = np.clip(blue * 0.7, 0, 255)     # Simulate SWIR2(B12)
-            
-            # Stack to create 6-band data
-            bands = np.stack([blue, green, red, nir, swir1, swir2], axis=-1)
+            # (height, width, 6) → (6, height, width) の形状に変換
+            img = np.stack([blue, green, red, nir, swir1, swir2], axis=0)
         else:
-            bands = img_array.astype(np.float32)
+            # 既に多バンド画像の場合
+            img = img_array.transpose(2, 0, 1) if len(img_array.shape) == 3 else img_array
         
-        # Ensure 6 bands
-        if bands.shape[-1] != 6:
-            if bands.shape[-1] == 3:
-                bands = np.concatenate([bands, bands], axis=-1)
-            else:
-                target_bands = 6
-                if bands.shape[-1] < target_bands:
-                    pad_bands = target_bands - bands.shape[-1]
-                    padding = np.zeros((*bands.shape[:-1], pad_bands))
-                    bands = np.concatenate([bands, padding], axis=-1)
-                else:
-                    bands = bands[:, :, :target_bands]
+        st.info(f"元画像: バンド数={img.shape[0]}, サイズ={img.shape[1]}x{img.shape[2]}, データ型={img.dtype}")
         
-        # Resize to 512x512 (image_processor.pyと同じ)
-        h, w = bands.shape[:2]
-        if h != 512 or w != 512:
+        # main.pyと同じリサイズ処理
+        if img.shape[1:] != target_size:
+            st.info(f"画像をリサイズ中: {img.shape[1]}x{img.shape[2]} → {target_size[0]}x{target_size[1]}")
+            from skimage.transform import resize
+            
             resized_bands = []
-            for i in range(6):
-                band = bands[:, :, i]
-                resized_band = cv2.resize(band, (512, 512), interpolation=cv2.INTER_LINEAR)
+            for i in range(img.shape[0]):
+                resized_band = resize(
+                    img[i], 
+                    target_size, 
+                    preserve_range=True,
+                    anti_aliasing=True
+                ).astype(img.dtype)
                 resized_bands.append(resized_band)
-            bands = np.stack(resized_bands, axis=-1)
+            img = np.stack(resized_bands, axis=0)
         
-        # image_processor.pyと同じ正規化方法を修正
-        # RGB画像の場合は0-255の値域なので、適切に調整
-        if img_array.shape[-1] == 3:  # 元がRGB画像の場合
-            # 0-255の値域を0-1に正規化
-            bands = bands / 255.0
-        else:
-            # Sentinel-2データの場合は1000-3000に調整してから0-1に正規化
-            bands = np.clip(bands, 1000, 3000)
-            bands = (bands - 1000) / 2000.0  # 0-1に正規化
+        # main.pyと同じデータ型変換処理
+        if img.dtype != target_dtype:
+            st.info(f"データ型を変換中: {img.dtype} → {target_dtype}")
+            
+            if img.dtype == np.uint8 and target_dtype == np.int16:
+                # uint8: 0-255 → int16: 1000-3000 (training data range)
+                img_min, img_max = img.min(), img.max()
+                img_normalized = (img.astype(np.float32) - img_min) / (img_max - img_min)
+                img = (img_normalized * 2000 + 1000).astype(target_dtype)
+            else:
+                img = img.astype(target_dtype)
         
-        # Convert to tensor format: (batch, channels, height, width)
-        tensor = torch.from_numpy(bands).float()
-        tensor = tensor.permute(2, 0, 1)  # (6, 512, 512)
-        tensor = tensor.unsqueeze(0)      # (1, 6, 512, 512)
+        st.success(f"前処理完了: バンド数={img.shape[0]}, サイズ={img.shape[1]}x{img.shape[2]}, データ型={img.dtype}")
         
+        return img
+        
+    except Exception as e:
+        st.error(f"❌ main.py方式前処理エラー: {e}")
+        return None
+
+def create_rgb_like_inference(processed_image):
+    """inference.pyのsave_prediction関数と同じRGB作成方法"""
+    try:
+        # inference.pyのsave_prediction関数と同じ処理
+        # バンド選択: [1, 2, 3, 8, 11, 12] から [RED, GREEN, BLUE] = [2, 1, 0]
+        rgb_bands = processed_image[[2, 1, 0], :, :]  # RED, GREEN, BLUE
+        
+        # inference.pyと同じ正規化処理
+        rgb_image = np.zeros((rgb_bands.shape[1], rgb_bands.shape[2], 3), dtype=np.uint8)
+        for i in range(3):
+            band = rgb_bands[i]
+            # inference.pyと同じ2-98パーセンタイル調整
+            p2, p98 = np.percentile(band, (2, 98))
+            if p98 > p2:
+                band_norm = np.clip((band - p2) / (p98 - p2) * 255, 0, 255)
+            else:
+                band_norm = np.clip(band * 255 / band.max() if band.max() > 0 else band, 0, 255)
+            rgb_image[:, :, i] = band_norm.astype(np.uint8)
+        
+        st.info(f"🔍 inference.py方式RGB画像形状: {rgb_image.shape}")
+        return rgb_image
+        
+    except Exception as e:
+        st.warning(f"⚠️ inference.py方式RGB作成エラー: {e}")
+        return None
+
+def create_tensor_for_model(processed_image):
+    """main.pyのload_example関数と同じテンソル作成"""
+    try:
+        # main.pyのload_example関数と同じ正規化
+        img = processed_image.astype(np.float32)
+        img = (img - img.mean(axis=(1, 2), keepdims=True)) / (
+            img.std(axis=(1, 2), keepdims=True) + 1e-6
+        )
+        
+        # バッチ次元を追加
+        imgs = np.expand_dims(img, axis=0)
+        
+        # テンソルに変換
+        tensor = torch.from_numpy(imgs).float()
+        
+        st.info(f"🔍 モデル用テンソル形状: {tensor.shape}")
         return tensor
         
     except Exception as e:
-        st.error(f"❌ 前処理エラー: {e}")
-        # Fallback: simple preprocessing
-        if len(img_array.shape) == 3:
-            if img_array.shape[-1] == 3:
-                bands = np.concatenate([img_array, img_array], axis=-1)
-            else:
-                bands = img_array
-        else:
-            bands = img_array
-            
-        bands = cv2.resize(bands, (512, 512))
-        if len(bands.shape) == 2:
-            bands = np.expand_dims(bands, -1)
-        if bands.shape[-1] == 1:
-            bands = np.repeat(bands, 6, axis=-1)
-        elif bands.shape[-1] != 6:
-            bands = bands[:, :, :6] if bands.shape[-1] > 6 else np.pad(bands, ((0,0), (0,0), (0, 6-bands.shape[-1])))
-            
-        tensor = torch.from_numpy(bands.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
-        tensor = tensor / 255.0 if tensor.max() > 1 else tensor
-        
-        return tensor
+        st.error(f"❌ テンソル作成エラー: {e}")
+        return None
 
 def create_realistic_flood_prediction(rgb_image, processed_tensor, model):
     """現実的な洪水検出予測を生成（参考画像と同じ形式）"""
@@ -898,20 +885,26 @@ def main():
                 st.write("**処理情報**:")
                 # 画像前処理（バックグラウンド処理）
                 try:
-                    processed_tensor = preprocess_image_standalone(rgb_image)
-                    st.success(f"✅ 前処理完了: {processed_tensor.shape}")
-                    
-                    # Sentinel-2 RGB表示を作成
-                    sentinel2_rgb = create_sentinel2_rgb_display(processed_tensor)
-                    if sentinel2_rgb is not None:
-                        st.success("✅ Sentinel-2 RGB表示作成完了")
-                        # プレビュー用に表示画像を更新
-                        display_rgb_image = sentinel2_rgb
-                        st.info("🛰️ Sentinel-2バンド合成表示を使用")
+                    # main.pyと同じ前処理
+                    processed_image = preprocess_image_like_main(rgb_image)
+                    if processed_image is not None:
+                        # inference.pyと同じRGB表示作成
+                        sentinel2_rgb = create_rgb_like_inference(processed_image)
+                        if sentinel2_rgb is not None:
+                            st.success("✅ inference.py方式RGB表示作成完了")
+                            display_rgb_image = sentinel2_rgb
+                            st.info("🛰️ inference.py方式Sentinel-2表示を使用")
+                        else:
+                            display_rgb_image = rgb_image
+                            st.info("📷 元画像を使用")
+                        
+                        # モデル用テンソル作成
+                        processed_tensor = create_tensor_for_model(processed_image)
+                        st.success(f"✅ モデル用テンソル作成完了: {processed_tensor.shape}")
                     else:
-                        st.warning("⚠️ Sentinel-2 RGB作成に失敗、元画像を使用")
+                        st.error("❌ 前処理に失敗")
+                        processed_tensor = None
                         display_rgb_image = rgb_image
-                        st.info("📷 元画像を使用")
                         
                 except Exception as preprocess_error:
                     st.error(f"❌ 前処理エラー: {preprocess_error}")
